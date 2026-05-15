@@ -1,66 +1,42 @@
 const std = @import("std");
 
-const metal = @import("gpu/metal.zig");
-const objc = @import("objc.zig");
+const mtl = @import("zmtl4");
 const render = @import("render.zig");
 
-const allocator = std.heap.page_allocator;
+pub const ObjCId = mtl.runtime.Id;
 
-pub const Error = error{
+const fallback_allocator = std.heap.page_allocator;
+
+pub const Error = mtl.Error || error{
     InvalidDevice,
     InvalidSurface,
-    MissingClass,
-    MissingSelector,
-    UnsupportedDevice,
-    LayerAllocationFailed,
-    CommandQueueCreationFailed,
-    CommandAllocatorCreationFailed,
-    CommandBufferCreationFailed,
-    BufferCreationFailed,
-    BufferContentsUnavailable,
-    ArgumentTableDescriptorCreationFailed,
-    ArgumentTableCreationFailed,
-    ResidencySetDescriptorCreationFailed,
-    ResidencySetCreationFailed,
-    SharedEventCreationFailed,
+    ShaderLibraryCreationFailed,
     FrameEncodingFailed,
-    RetainFailed,
+    FrameWaitTimedOut,
+    InvalidClipRect,
     OutOfMemory,
 };
 
 pub const max_frames_in_flight = 3;
-pub const vertex_buffer_capacity = render.max_vertices;
-pub const vertex_buffer_byte_len = @sizeOf(render.Vertex) * vertex_buffer_capacity;
+pub const frame_quad_cap = render.max_quads;
+pub const frame_buf_len = @sizeOf(render.GpuFrameData);
+const frame_wait_timeout_ms = 10;
 const frame_drain_timeout_ms = 5_000;
 
-const FrameResources = struct {
-    vertex_buffer: objc.Id,
-    vertex_buffer_contents: [*]u8,
-    vertex_buffer_gpu_address: metal.MTLGPUAddress,
+extern fn zpui_platform_create_shader_library(device: ObjCId) ObjCId;
+
+const Frame = struct {
+    buf: mtl.resource.OwnedBuffer,
+    bytes: [*]u8,
+    addr: mtl.abi.GPUAddress,
 };
 
-pub const PreparedFrame = extern struct {
-    clear_color: [4]f64,
-    vertex_count: u32,
+const Draw = struct {
+    clear_color: mtl.abi.ClearColor,
+    draw_vertex_count: u32,
     batch_count: u32,
-    scissor_x: u32,
-    scissor_y: u32,
-    scissor_width: u32,
-    scissor_height: u32,
-    reserved: [2]u32 = .{ 0, 0 },
+    scissor: render.ClipRect,
 };
-
-pub fn emptyPreparedFrame() PreparedFrame {
-    return .{
-        .clear_color = .{ 0, 0, 0, 1 },
-        .vertex_count = 0,
-        .batch_count = 0,
-        .scissor_x = 0,
-        .scissor_y = 0,
-        .scissor_width = 0,
-        .scissor_height = 0,
-    };
-}
 
 pub const Status = enum(c_int) {
     ok = 0,
@@ -83,18 +59,40 @@ pub const Status = enum(c_int) {
     residency_set_descriptor_creation_failed = 26,
     residency_set_creation_failed = 27,
     frame_encoding_failed = 28,
+    shader_library_creation_failed = 29,
+    compiler_descriptor_creation_failed = 30,
+    compiler_creation_failed = 31,
+    function_descriptor_creation_failed = 32,
+    string_creation_failed = 33,
+    pipeline_descriptor_creation_failed = 34,
+    pipeline_creation_failed = 35,
+    render_pass_descriptor_creation_failed = 36,
+    render_attachment_descriptor_creation_failed = 37,
+    render_encoder_creation_failed = 38,
+    drawable_texture_unavailable = 39,
+    invalid_drawable_size = 40,
+    invalid_scale = 41,
+    frame_wait_timed_out = 42,
+    invalid_clip_rect = 43,
+    object_creation_failed = 44,
+    system_default_device_unavailable = 45,
+    invalid_drawable_count = 46,
+    drawable_unavailable = 47,
+    too_many_items = 48,
 
     pub fn fromError(err: Error) Status {
         return switch (err) {
             Error.InvalidDevice => .invalid_device,
             Error.InvalidSurface => .invalid_surface,
             Error.MissingClass => .missing_class,
-            Error.MissingSelector => .missing_selector,
+            Error.ObjectCreationFailed => .object_creation_failed,
+            Error.RetainFailed => .retain_failed,
+            Error.SystemDefaultDeviceUnavailable => .system_default_device_unavailable,
             Error.UnsupportedDevice => .unsupported_device,
-            Error.LayerAllocationFailed => .layer_allocation_failed,
             Error.CommandQueueCreationFailed => .command_queue_creation_failed,
             Error.CommandAllocatorCreationFailed => .command_allocator_creation_failed,
             Error.CommandBufferCreationFailed => .command_buffer_creation_failed,
+            Error.CommandEncoderCreationFailed => .render_encoder_creation_failed,
             Error.BufferCreationFailed => .buffer_creation_failed,
             Error.BufferContentsUnavailable => .buffer_contents_unavailable,
             Error.ArgumentTableDescriptorCreationFailed => .argument_table_descriptor_creation_failed,
@@ -102,97 +100,129 @@ pub const Status = enum(c_int) {
             Error.ResidencySetDescriptorCreationFailed => .residency_set_descriptor_creation_failed,
             Error.ResidencySetCreationFailed => .residency_set_creation_failed,
             Error.SharedEventCreationFailed => .shared_event_creation_failed,
+            Error.InvalidDrawableSize => .invalid_drawable_size,
+            Error.InvalidDrawableCount => .invalid_drawable_count,
+            Error.InvalidScale => .invalid_scale,
+            Error.LayerCreationFailed => .layer_allocation_failed,
+            Error.DrawableUnavailable => .drawable_unavailable,
+            Error.DrawableTextureUnavailable => .drawable_texture_unavailable,
+            Error.RenderPassDescriptorCreationFailed => .render_pass_descriptor_creation_failed,
+            Error.RenderAttachmentDescriptorUnavailable => .render_attachment_descriptor_creation_failed,
+            Error.CompilerDescriptorCreationFailed => .compiler_descriptor_creation_failed,
+            Error.CompilerCreationFailed => .compiler_creation_failed,
+            Error.FunctionDescriptorCreationFailed => .function_descriptor_creation_failed,
+            Error.PipelineDescriptorCreationFailed => .pipeline_descriptor_creation_failed,
+            Error.PipelineCreationFailed => .pipeline_creation_failed,
+            Error.TooManyItems => .too_many_items,
+            Error.ShaderLibraryCreationFailed => .shader_library_creation_failed,
             Error.FrameEncodingFailed => .frame_encoding_failed,
-            Error.RetainFailed => .retain_failed,
+            Error.FrameWaitTimedOut => .frame_wait_timed_out,
+            Error.InvalidClipRect => .invalid_clip_rect,
             Error.OutOfMemory => .out_of_memory,
         };
     }
 };
 
 pub const Surface = struct {
-    device: objc.Id,
-    layer: objc.Id,
-    command_queue: objc.Id,
-    command_buffer: objc.Id,
-    command_allocators: [max_frames_in_flight]objc.Id,
-    frame_resources: [max_frames_in_flight]FrameResources,
-    argument_table: objc.Id,
-    residency_set: objc.Id,
-    frame_event: objc.Id,
-    caps: metal.DeviceCapabilities,
+    allocator: std.mem.Allocator,
+    device: mtl.OwnedDevice,
+    layer: mtl.layer.OwnedLayer,
+    command_queue: mtl.command.OwnedCommandQueue,
+    command_buffer: mtl.command.OwnedCommandBuffer,
+    pipeline_state: mtl.render.OwnedRenderPipelineState,
+    command_allocators: [max_frames_in_flight]mtl.command.OwnedCommandAllocator,
+    frames: [max_frames_in_flight]Frame,
+    argument_table: mtl.resource.OwnedArgumentTable,
+    residency_set: mtl.resource.OwnedResidencySet,
+    layer_residency_set: ?mtl.layer.LayerResidencySet,
+    frame_event: mtl.resource.OwnedSharedEvent,
+    caps: mtl.runtime.DeviceCapabilities,
     current_frame_index: u64 = max_frames_in_flight,
-    drawable_size: objc.CGSize = .{ .width = 0, .height = 0 },
-    scale: objc.CGFloat = 1.0,
+    drawable_size: mtl.abi.Size2D = .{ .width = 0, .height = 0 },
+    scale: mtl.abi.CGFloat = 1.0,
     resize_generation: u64 = 0,
-    config: metal.LayerConfig,
+    config: mtl.layer.Config,
 
-    pub fn create(device: objc.Id, config: metal.LayerConfig) Error!*Surface {
-        const retained_device = try retainObject(device);
-        errdefer releaseObject(retained_device);
+    pub fn create(device: ObjCId, config: mtl.layer.Config) Error!*Surface {
+        return createWithAllocator(fallback_allocator, device, config);
+    }
 
-        const caps = try metal.queryDeviceCapabilities(retained_device);
-        try metal.validateTargetDevice(caps, metal.developer_target_profile);
+    pub fn createWithAllocator(alloc: std.mem.Allocator, device: ObjCId, config: mtl.layer.Config) Error!*Surface {
+        const device_ref = mtl.Device.fromRaw(device orelse return Error.InvalidDevice);
+        var owned_device = try mtl.retain(.device, device_ref);
+        errdefer owned_device.deinit();
 
-        const layer = try metal.createLayer(retained_device, config);
-        const retained_layer = try retainObject(layer);
-        errdefer releaseObject(retained_layer);
+        const caps = try mtl.queryDeviceCapabilities(owned_device.ref());
+        try mtl.validateTargetDevice(caps, mtl.runtime.developer_target_profile);
 
-        const command_queue = try metal.createMetal4CommandQueue(retained_device);
-        errdefer releaseObject(command_queue);
+        var layer = try mtl.layer.create(owned_device.ref(), config);
+        errdefer layer.deinit();
+        const layer_residency_set = mtl.layer.residencySet(layer.ref());
 
-        const command_buffer = try metal.createMetal4CommandBuffer(retained_device);
-        errdefer releaseObject(command_buffer);
+        var command_queue = try mtl.command.createQueue(owned_device.ref());
+        errdefer command_queue.deinit();
 
-        var command_allocators: [max_frames_in_flight]objc.Id = undefined;
+        var command_buffer = try mtl.command.createCommandBuffer(owned_device.ref());
+        errdefer command_buffer.deinit();
+
+        var pipeline_state = try createSolidQuadPipeline(owned_device.ref(), config.pixel_format);
+        errdefer pipeline_state.deinit();
+
+        var command_allocators: [max_frames_in_flight]mtl.command.OwnedCommandAllocator = undefined;
         var allocator_count: usize = 0;
         errdefer {
-            for (command_allocators[0..allocator_count]) |command_allocator| {
-                releaseObject(command_allocator);
+            for (command_allocators[0..allocator_count]) |*command_allocator| {
+                command_allocator.deinit();
             }
         }
         while (allocator_count < command_allocators.len) : (allocator_count += 1) {
-            command_allocators[allocator_count] = try metal.createMetal4CommandAllocator(retained_device);
+            command_allocators[allocator_count] = try mtl.command.createAllocator(owned_device.ref());
         }
 
-        const residency_set = try metal.createResidencySet(retained_device, max_frames_in_flight);
-        errdefer releaseObject(residency_set);
+        var residency_set = try mtl.resource.createResidencySetWithCapacity(owned_device.ref(), max_frames_in_flight);
+        errdefer residency_set.deinit();
 
-        var frame_resources: [max_frames_in_flight]FrameResources = undefined;
-        var frame_resource_count: usize = 0;
+        var frames: [max_frames_in_flight]Frame = undefined;
+        var frame_count: usize = 0;
         errdefer {
-            for (frame_resources[0..frame_resource_count]) |frame_resource| {
-                releaseObject(frame_resource.vertex_buffer);
+            for (frames[0..frame_count]) |*frame| {
+                frame.buf.deinit();
             }
         }
-        while (frame_resource_count < frame_resources.len) {
-            frame_resources[frame_resource_count] = try createFrameResources(retained_device);
-            const vertex_buffer = frame_resources[frame_resource_count].vertex_buffer;
-            frame_resource_count += 1;
-            try metal.addResidencyAllocation(residency_set, vertex_buffer);
+        while (frame_count < frames.len) {
+            frames[frame_count] = try createFrame(owned_device.ref());
+            const buf = frames[frame_count].buf;
+            frame_count += 1;
+            mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(buf.raw));
         }
-        try metal.commitResidencySet(residency_set);
-        try metal.requestResidencySet(residency_set);
-        errdefer metal.endResidencySet(residency_set) catch {};
-        try metal.addCommandQueueResidencySet(command_queue, residency_set);
-        errdefer metal.removeCommandQueueResidencySet(command_queue, residency_set) catch {};
+        mtl.resource.commit(residency_set.ref());
+        mtl.resource.requestResidency(residency_set.ref());
+        errdefer mtl.resource.endResidency(residency_set.ref());
+        mtl.command.addResidencySet(command_queue.ref(), residency_set.ref());
+        errdefer mtl.command.removeResidencySet(command_queue.ref(), residency_set.ref());
 
-        const argument_table = try metal.createMetal4ArgumentTable(retained_device, 1);
-        errdefer releaseObject(argument_table);
+        var argument_table = try mtl.resource.createArgumentTableWithConfig(owned_device.ref(), .{
+            .max_buffer_bind_count = 1,
+        });
+        errdefer argument_table.deinit();
 
-        const frame_event = try metal.createSharedEvent(retained_device);
-        errdefer releaseObject(frame_event);
-        objc.sendVoidU64(frame_event, try sel("setSignaledValue:"), max_frames_in_flight - 1);
+        var frame_event = try mtl.resource.createSharedEvent(owned_device.ref());
+        errdefer frame_event.deinit();
+        mtl.resource.setSignaledValue(frame_event.ref(), max_frames_in_flight - 1);
 
-        const surface = allocator.create(Surface) catch return Error.OutOfMemory;
+        const surface = alloc.create(Surface) catch return Error.OutOfMemory;
         surface.* = .{
-            .device = retained_device,
-            .layer = retained_layer,
+            .allocator = alloc,
+            .device = owned_device,
+            .layer = layer,
             .command_queue = command_queue,
             .command_buffer = command_buffer,
+            .pipeline_state = pipeline_state,
             .command_allocators = command_allocators,
-            .frame_resources = frame_resources,
+            .frames = frames,
             .argument_table = argument_table,
             .residency_set = residency_set,
+            .layer_residency_set = layer_residency_set,
             .frame_event = frame_event,
             .caps = caps,
             .config = config,
@@ -201,74 +231,117 @@ pub const Surface = struct {
     }
 
     pub fn destroy(surface: *Surface) void {
+        const alloc = surface.allocator;
         surface.drain();
-        metal.removeCommandQueueResidencySet(surface.command_queue, surface.residency_set) catch {};
-        metal.endResidencySet(surface.residency_set) catch {};
+        mtl.command.removeResidencySet(surface.command_queue.ref(), surface.residency_set.ref());
+        mtl.resource.endResidency(surface.residency_set.ref());
 
-        for (surface.command_allocators) |command_allocator| {
-            releaseObject(command_allocator);
+        for (&surface.command_allocators) |*command_allocator| {
+            command_allocator.deinit();
         }
-        releaseObject(surface.argument_table);
-        releaseObject(surface.residency_set);
-        for (surface.frame_resources) |frame_resource| {
-            releaseObject(frame_resource.vertex_buffer);
+        surface.argument_table.deinit();
+        surface.residency_set.deinit();
+        for (&surface.frames) |*frame| {
+            frame.buf.deinit();
         }
-        releaseObject(surface.frame_event);
-        releaseObject(surface.command_buffer);
-        releaseObject(surface.command_queue);
-        releaseObject(surface.layer);
-        releaseObject(surface.device);
-        allocator.destroy(surface);
+        surface.frame_event.deinit();
+        surface.pipeline_state.deinit();
+        surface.command_buffer.deinit();
+        surface.command_queue.deinit();
+        surface.layer.deinit();
+        surface.device.deinit();
+        alloc.destroy(surface);
     }
 
-    pub fn resize(surface: *Surface, drawable_size: objc.CGSize, scale: objc.CGFloat) Error!void {
-        if (drawable_size.width <= 0 or drawable_size.height <= 0 or scale <= 0) return;
-
-        try metal.resizeLayer(surface.layer, drawable_size, scale);
+    pub fn resize(surface: *Surface, drawable_size: mtl.abi.Size2D, scale: mtl.abi.CGFloat) Error!void {
+        try mtl.layer.resize(surface.layer.ref(), drawable_size, scale);
         surface.drawable_size = drawable_size;
         surface.scale = scale;
         surface.resize_generation +%= 1;
     }
 
-    pub fn nextCommandAllocator(surface: *Surface) ?objc.Id {
+    pub fn nextCommandAllocator(surface: *Surface) Error!mtl.command.CommandAllocator {
         const allocator_index = surface.current_frame_index % max_frames_in_flight;
         const wait_value = surface.current_frame_index - max_frames_in_flight;
-        const wait_sel = objc.selector("waitUntilSignaledValue:timeoutMS:") orelse return null;
-        if (!objc.sendBoolU64U64(surface.frame_event, wait_sel, wait_value, 10)) return null;
+        if (!mtl.resource.waitUntilSignaledValue(surface.frame_event.ref(), wait_value, frame_wait_timeout_ms)) {
+            return Error.FrameWaitTimedOut;
+        }
 
-        const command_allocator = surface.command_allocators[@intCast(allocator_index)];
-        const reset_sel = objc.selector("reset") orelse return null;
-        objc.sendVoid0(command_allocator, reset_sel);
+        const command_allocator = surface.command_allocators[@intCast(allocator_index)].ref();
+        mtl.command.resetAllocator(command_allocator);
         return command_allocator;
     }
 
     pub fn drain(surface: *Surface) void {
-        const wait_sel = objc.selector("waitUntilSignaledValue:timeoutMS:") orelse return;
         const last_submitted_frame = surface.current_frame_index - 1;
-        _ = objc.sendBoolU64U64(surface.frame_event, wait_sel, last_submitted_frame, frame_drain_timeout_ms);
+        _ = mtl.resource.waitUntilSignaledValue(surface.frame_event.ref(), last_submitted_frame, frame_drain_timeout_ms);
     }
 
-    pub fn signalFrameCompletion(surface: *Surface) Error!void {
-        objc.sendVoidIdU64(
-            surface.command_queue,
-            try sel("signalEvent:value:"),
-            surface.frame_event,
-            surface.current_frame_index,
-        );
+    pub fn signalFrameCompletion(surface: *Surface) void {
+        mtl.command.signalEvent(surface.command_queue.ref(), surface.frame_event.ref(), surface.current_frame_index);
         surface.current_frame_index +%= 1;
     }
 
-    pub fn preparePacket(surface: *Surface, packet: *const render.RenderPacket, prepared: *PreparedFrame) Error!void {
-        var vertices: [render.max_vertices]render.Vertex = undefined;
-        const compiled = render.compilePacket(packet, &vertices) catch return Error.FrameEncodingFailed;
-        if (compiled.vertex_count > vertex_buffer_capacity) return Error.BufferCreationFailed;
+    pub fn drawPacket(surface: *Surface, packet: *const render.RenderPacket, drawable_id: ObjCId) Error!void {
+        const drawable = mtl.layer.Drawable.fromRaw(drawable_id orelse return Error.DrawableUnavailable);
+        const command_allocator = try surface.nextCommandAllocator();
+        const prepared = try surface.preparePacket(packet);
+        const drawable_texture = try mtl.layer.drawableTexture(drawable);
+        var pass_descriptor = try mtl.render.createColorPassDescriptor(drawable_texture, prepared.clear_color);
+        defer pass_descriptor.deinit();
+
+        mtl.command.begin(surface.command_buffer.ref(), command_allocator);
+        var command_buffer_open = true;
+        errdefer if (command_buffer_open) mtl.command.end(surface.command_buffer.ref());
+        surface.useFrameResidency();
+
+        const encoder = try mtl.render.renderCommandEncoder(surface.command_buffer.ref(), pass_descriptor.ref());
+        var encoder_open = true;
+        errdefer if (encoder_open) mtl.render.endEncoding(encoder);
+        mtl.render.setViewport(encoder, .{
+            .origin_x = 0.0,
+            .origin_y = 0.0,
+            .width = surface.drawable_size.width,
+            .height = surface.drawable_size.height,
+            .z_near = 0.0,
+            .z_far = 1.0,
+        });
+
+        if (prepared.draw_vertex_count > 0 and prepared.batch_count > 0) {
+            mtl.render.setScissorRect(encoder, .{
+                .x = prepared.scissor.x,
+                .y = prepared.scissor.y,
+                .width = prepared.scissor.width,
+                .height = prepared.scissor.height,
+            });
+            mtl.render.setPipelineState(encoder, surface.pipeline_state.ref());
+            mtl.render.setArgumentTable(encoder, surface.argument_table.ref(), mtl.abi.render_stage_vertex);
+            mtl.render.drawTriangles(encoder, @intCast(prepared.draw_vertex_count));
+        }
+
+        mtl.render.endEncoding(encoder);
+        encoder_open = false;
+        mtl.command.end(surface.command_buffer.ref());
+        command_buffer_open = false;
+
+        mtl.command.waitForDrawable(surface.command_queue.ref(), drawable);
+        mtl.command.commitOne(surface.command_queue.ref(), surface.command_buffer.ref());
+        surface.signalFrameCompletion();
+        mtl.command.signalDrawable(surface.command_queue.ref(), drawable);
+        mtl.layer.present(drawable);
+    }
+
+    fn preparePacket(surface: *Surface, packet: *const render.RenderPacket) Error!Draw {
+        var frame_data: render.GpuFrameData = undefined;
+        const compiled = render.compilePacket(packet, &frame_data) catch return Error.FrameEncodingFailed;
+        if (compiled.quad_count > frame_quad_cap) return Error.BufferCreationFailed;
 
         const frame_slot = surface.currentFrameSlot();
-        const frame_resource = surface.frame_resources[frame_slot];
-        const byte_len = @as(usize, compiled.vertex_count) * @sizeOf(render.Vertex);
-        const frame_vertices: [*]const u8 = @ptrCast(&vertices);
-        @memcpy(frame_resource.vertex_buffer_contents[0..byte_len], frame_vertices[0..byte_len]);
-        try metal.bindArgumentTableBufferAddress(surface.argument_table, frame_resource.vertex_buffer_gpu_address, 0);
+        const frame = surface.frames[frame_slot];
+        const frame_bytes: [*]const u8 = @ptrCast(&frame_data);
+        const byte_len = render.gpuFrameDataByteLen(compiled.quad_count);
+        @memcpy(frame.bytes[0..byte_len], frame_bytes[0..byte_len]);
+        mtl.resource.setAddress(surface.argument_table.ref(), frame.addr, 0);
 
         const clip = if (packet.clip_count > 0) packet.clips[0] else render.ClipRect{
             .x = 0,
@@ -276,56 +349,87 @@ pub const Surface = struct {
             .width = 0,
             .height = 0,
         };
-        prepared.* = .{
-            .clear_color = packet.clear_color,
-            .vertex_count = compiled.vertex_count,
+        if (compiled.draw_vertex_count > 0 and packet.batch_count > 0) {
+            try validateClipRect(clip, surface.drawable_size);
+        }
+        return .{
+            .clear_color = toClearColor(packet.clear_color),
+            .draw_vertex_count = compiled.draw_vertex_count,
             .batch_count = packet.batch_count,
-            .scissor_x = clip.x,
-            .scissor_y = clip.y,
-            .scissor_width = clip.width,
-            .scissor_height = clip.height,
+            .scissor = clip,
         };
     }
 
     fn currentFrameSlot(surface: *const Surface) usize {
         return @intCast(surface.current_frame_index % max_frames_in_flight);
     }
+
+    fn useFrameResidency(surface: *Surface) void {
+        mtl.command.useResidencySet(surface.command_buffer.ref(), surface.residency_set.ref());
+        if (surface.layer_residency_set) |layer_residency_set| {
+            mtl.command.useLayerResidencySet(surface.command_buffer.ref(), layer_residency_set);
+        }
+    }
 };
 
-fn retainObject(object: objc.Id) Error!objc.Id {
-    const retain_sel = objc.selector("retain") orelse return Error.MissingSelector;
-    return objc.sendId0(object, retain_sel) orelse Error.RetainFailed;
+fn createSolidQuadPipeline(
+    device: mtl.Device,
+    pixel_format: mtl.abi.PixelFormat,
+) Error!mtl.render.OwnedRenderPipelineState {
+    var library = mtl.render.OwnedLibrary.fromRaw(
+        zpui_platform_create_shader_library(device.raw) orelse return Error.ShaderLibraryCreationFailed,
+    );
+    defer library.deinit();
+
+    return mtl.render.createPipelineStateFromLibrary(device, library.ref(), "zpui_vertex", "zpui_fragment", .{
+        .pixel_format = pixel_format,
+    });
 }
 
-fn createFrameResources(device: objc.Id) Error!FrameResources {
-    const vertex_buffer = try metal.createBuffer(
+fn createFrame(device: mtl.Device) Error!Frame {
+    var buf = try mtl.resource.createBuffer(
         device,
-        vertex_buffer_byte_len,
-        metal.shared_write_combined_buffer_options,
+        frame_buf_len,
+        mtl.abi.shared_write_combined_buffer_options,
     );
-    errdefer releaseObject(vertex_buffer);
+    errdefer buf.deinit();
 
     return .{
-        .vertex_buffer = vertex_buffer,
-        .vertex_buffer_contents = try metal.bufferContents(vertex_buffer),
-        .vertex_buffer_gpu_address = try metal.bufferGpuAddress(vertex_buffer),
+        .buf = buf,
+        .bytes = try mtl.resource.contents(buf.ref()),
+        .addr = mtl.resource.gpuAddress(buf.ref()),
     };
 }
 
-fn releaseObject(object: objc.Id) void {
-    const release_sel = objc.selector("release") orelse return;
-    objc.sendVoid0(object, release_sel);
+fn validateClipRect(clip: render.ClipRect, drawable_size: mtl.abi.Size2D) Error!void {
+    if (clip.width == 0 or clip.height == 0) return Error.InvalidClipRect;
+
+    const drawable_width = try drawableExtent(drawable_size.width);
+    const drawable_height = try drawableExtent(drawable_size.height);
+    if (clip.x > drawable_width or clip.width > drawable_width - clip.x) return Error.InvalidClipRect;
+    if (clip.y > drawable_height or clip.height > drawable_height - clip.y) return Error.InvalidClipRect;
 }
 
-fn sel(name: [*:0]const u8) Error!objc.Sel {
-    return objc.selector(name) orelse Error.MissingSelector;
+fn drawableExtent(value: f64) Error!u32 {
+    if (value <= 0) return Error.InvalidDrawableSize;
+    const floored = @floor(value);
+    if (floored <= 0) return Error.InvalidDrawableSize;
+    const capped = @min(floored, @as(f64, @floatFromInt(std.math.maxInt(u32))));
+    return @intFromFloat(capped);
 }
 
-pub export fn zpui_surface_create(device: ?objc.Id, out_surface: *?*Surface) c_int {
+fn toClearColor(color: [4]f64) mtl.abi.ClearColor {
+    return .{
+        .red = color[0],
+        .green = color[1],
+        .blue = color[2],
+        .alpha = color[3],
+    };
+}
+
+pub export fn zpui_surface_create(device: ObjCId, out_surface: *?*Surface) c_int {
     out_surface.* = null;
-    const unwrapped_device = device orelse return @intFromEnum(Status.invalid_device);
-
-    const surface = Surface.create(unwrapped_device, .{}) catch |err| {
+    const surface = Surface.create(device, .{}) catch |err| {
         return @intFromEnum(Status.fromError(err));
     };
     out_surface.* = surface;
@@ -337,37 +441,9 @@ pub export fn zpui_surface_destroy(surface: ?*Surface) void {
     unwrapped_surface.destroy();
 }
 
-pub export fn zpui_surface_layer(surface: ?*Surface) ?objc.Id {
+pub export fn zpui_surface_layer(surface: ?*Surface) ObjCId {
     const unwrapped_surface = surface orelse return null;
-    return unwrapped_surface.layer;
-}
-
-pub export fn zpui_surface_mtl4_command_queue(surface: ?*Surface) ?objc.Id {
-    const unwrapped_surface = surface orelse return null;
-    return unwrapped_surface.command_queue;
-}
-
-pub export fn zpui_surface_mtl4_command_buffer(surface: ?*Surface) ?objc.Id {
-    const unwrapped_surface = surface orelse return null;
-    return unwrapped_surface.command_buffer;
-}
-
-pub export fn zpui_surface_next_mtl4_command_allocator(surface: ?*Surface) ?objc.Id {
-    const unwrapped_surface = surface orelse return null;
-    return unwrapped_surface.nextCommandAllocator();
-}
-
-pub export fn zpui_surface_signal_frame_completion(surface: ?*Surface) c_int {
-    const unwrapped_surface = surface orelse return @intFromEnum(Status.invalid_surface);
-    unwrapped_surface.signalFrameCompletion() catch |err| {
-        return @intFromEnum(Status.fromError(err));
-    };
-    return @intFromEnum(Status.ok);
-}
-
-pub export fn zpui_surface_argument_table(surface: ?*Surface) ?objc.Id {
-    const unwrapped_surface = surface orelse return null;
-    return unwrapped_surface.argument_table;
+    return unwrapped_surface.layer.raw;
 }
 
 pub export fn zpui_surface_resize(surface: ?*Surface, width: f64, height: f64, scale: f64) c_int {
@@ -381,40 +457,35 @@ pub export fn zpui_surface_resize(surface: ?*Surface, width: f64, height: f64, s
     return @intFromEnum(Status.ok);
 }
 
-test "prepared frame layout stays stable across the Objective-C ABI" {
-    try std.testing.expectEqual(@as(usize, 64), @sizeOf(PreparedFrame));
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(PreparedFrame, "clear_color"));
-    try std.testing.expectEqual(@as(usize, 32), @offsetOf(PreparedFrame, "vertex_count"));
-    try std.testing.expectEqual(@as(usize, 36), @offsetOf(PreparedFrame, "batch_count"));
-    try std.testing.expectEqual(@as(usize, 40), @offsetOf(PreparedFrame, "scissor_x"));
-    try std.testing.expectEqual(@as(usize, 44), @offsetOf(PreparedFrame, "scissor_y"));
-    try std.testing.expectEqual(@as(usize, 48), @offsetOf(PreparedFrame, "scissor_width"));
-    try std.testing.expectEqual(@as(usize, 52), @offsetOf(PreparedFrame, "scissor_height"));
-    try std.testing.expectEqual(@as(usize, 56), @offsetOf(PreparedFrame, "reserved"));
-}
-
-test "empty prepared frame has neutral draw defaults" {
-    const prepared = emptyPreparedFrame();
-    try std.testing.expectEqual([4]f64{ 0, 0, 0, 1 }, prepared.clear_color);
-    try std.testing.expectEqual(@as(u32, 0), prepared.vertex_count);
-    try std.testing.expectEqual(@as(u32, 0), prepared.batch_count);
-    try std.testing.expectEqual(@as(u32, 0), prepared.scissor_width);
-    try std.testing.expectEqual(@as(u32, 0), prepared.scissor_height);
-}
-
 test "surface status values stay stable across the Objective-C ABI" {
     try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(Status.ok));
     try std.testing.expectEqual(@as(c_int, 10), @intFromEnum(Status.invalid_device));
-    try std.testing.expectEqual(@as(c_int, 28), @intFromEnum(Status.frame_encoding_failed));
+    try std.testing.expectEqual(@as(c_int, 39), @intFromEnum(Status.drawable_texture_unavailable));
+    try std.testing.expectEqual(@as(c_int, 40), @intFromEnum(Status.invalid_drawable_size));
+    try std.testing.expectEqual(@as(c_int, 48), @intFromEnum(Status.too_many_items));
+    try std.testing.expectEqual(Status.invalid_drawable_size, Status.fromError(Error.InvalidDrawableSize));
+    try std.testing.expectEqual(Status.invalid_scale, Status.fromError(Error.InvalidScale));
     try std.testing.expectEqual(Status.invalid_device, Status.fromError(Error.InvalidDevice));
     try std.testing.expectEqual(Status.invalid_surface, Status.fromError(Error.InvalidSurface));
     try std.testing.expectEqual(Status.unsupported_device, Status.fromError(Error.UnsupportedDevice));
+    try std.testing.expectEqual(Status.pipeline_creation_failed, Status.fromError(Error.PipelineCreationFailed));
     try std.testing.expectEqual(Status.frame_encoding_failed, Status.fromError(Error.FrameEncodingFailed));
+    try std.testing.expectEqual(Status.frame_wait_timed_out, Status.fromError(Error.FrameWaitTimedOut));
+    try std.testing.expectEqual(Status.invalid_clip_rect, Status.fromError(Error.InvalidClipRect));
+    try std.testing.expectEqual(Status.render_encoder_creation_failed, Status.fromError(Error.CommandEncoderCreationFailed));
     try std.testing.expectEqual(Status.out_of_memory, Status.fromError(Error.OutOfMemory));
 }
 
-test "surface vertex buffer capacity matches the render packet contract" {
-    try std.testing.expectEqual(@as(usize, render.max_vertices), vertex_buffer_capacity);
-    try std.testing.expectEqual(@as(usize, 1536), vertex_buffer_byte_len);
-    try std.testing.expectEqual(@sizeOf(render.Vertex) * vertex_buffer_capacity, vertex_buffer_byte_len);
+test "surface clip validation rejects scissors outside the drawable" {
+    try validateClipRect(.{ .x = 0, .y = 0, .width = 640, .height = 480 }, .{ .width = 640, .height = 480 });
+    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 0, .y = 0, .width = 641, .height = 480 }, .{ .width = 640, .height = 480 }));
+    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 640, .y = 0, .width = 1, .height = 480 }, .{ .width = 640, .height = 480 }));
+    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 0, .y = 0, .width = 0, .height = 480 }, .{ .width = 640, .height = 480 }));
+    try std.testing.expectError(Error.InvalidDrawableSize, validateClipRect(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{ .width = 0, .height = 480 }));
+}
+
+test "surface frame buffer capacity matches the render packet contract" {
+    try std.testing.expectEqual(@as(usize, render.max_quads), frame_quad_cap);
+    try std.testing.expectEqual(@as(usize, 400), frame_buf_len);
+    try std.testing.expectEqual(@sizeOf(render.GpuFrameData), frame_buf_len);
 }

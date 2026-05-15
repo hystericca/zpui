@@ -4,11 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const zmtl4_dep = b.dependency("zmtl4", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const zpui = b.addModule("zpui", .{
         .root_source_file = b.path("src/zpui.zig"),
         .target = target,
         .optimize = optimize,
     });
+    zpui.addImport("zmtl4", zmtl4_dep.module("zmtl4"));
     linkMacOSPlatform(b, zpui, target);
 
     const exe = b.addExecutable(.{

@@ -28,19 +28,20 @@ Useful GPUI references:
 
 - `ZPUIWindow : NSWindow`
 - `ZPUIMetalView : NSView`
-- `src/surface.zig` owns the native surface state: retained `MTLDevice`, retained `CAMetalLayer`, owned `MTL4CommandQueue`, reusable `MTL4CommandBuffer`, three `MTL4CommandAllocator` instances, `MTLSharedEvent` frame fencing, three per-frame shared/write-combined vertex buffers, an app `MTLResidencySet`, an `MTL4ArgumentTable`, drawable size, backing scale, resize generation, and layer config.
-- `src/gpu/metal.zig` records device capabilities and enforces the developer target profile: unified memory, Metal 4, and Apple GPU family 10 or newer.
-- `ZPUIRenderer` owns a `ZPUISurface *` handle, plus the temporary Objective-C render pipeline.
+- `src/surface.zig` owns the native surface state: retained `MTLDevice`, retained `CAMetalLayer`, owned `MTL4CommandQueue`, reusable `MTL4CommandBuffer`, Metal 4 render pipeline state, three `MTL4CommandAllocator` instances, `MTLSharedEvent` frame fencing, three per-frame shared/write-combined frame-data buffers, an app `MTLResidencySet`, an `MTL4ArgumentTable`, drawable size, backing scale, resize generation, and layer config.
+- `src/metal.zig` records device capabilities and enforces the developer target profile: unified memory, Metal 4, and Apple GPU family 10 or newer.
+- `ZPUIRenderer` owns only a `ZPUISurface *` handle; AppKit remains the host, but Metal command authorship lives in Zig.
 - `ZPUIMetalView.makeBackingLayer` returns `renderer.layer`.
-- `src/gpu/metal.zig` creates and configures the `CAMetalLayer` through explicit Objective-C runtime calls.
+- `src/metal.zig` creates and configures the `CAMetalLayer` through explicit Objective-C runtime calls.
 - Resize/backing changes route through Zig before updating `contentsScale` and `drawableSize`.
 - `NSView.displayLink(target:selector:)` schedules frame callbacks on current macOS.
 - A dirty bit requests frames; the display link stops when no frame is pending.
 - A continuous-frame flag exists for future animation, but the static solid-quad example does not draw forever.
-- Zig owns `RenderPacket` v0: fixed-capacity solid quads, one batch, one clip rect, and CPU expansion into triangle vertices for the active frame slot.
-- The demo packet builder creates a small `RenderPacket`; Objective-C asks Zig to prepare the current frame slot and return a small `ZPUIPreparedFrame` with clear color, vertex count, batch count, and scissor rect, then encodes that data into Metal.
+- Zig owns `RenderPacket` v0: fixed-capacity solid quads, one batch, one clip rect, and compact per-frame GPU data.
+- The demo packet builder creates a small `RenderPacket`; Objective-C obtains the drawable and calls Zig to encode, submit, signal, and present the frame.
 - The first UI-shaped pixels are Zig-authored solid quads encoded directly into the layer drawable.
-- Zig writes frame vertices into the active frame slot's shared `MTLBuffer`, binds its `gpuAddress` into `MTL4ArgumentTable`, and Objective-C only issues `setArgumentTable:atStages:` plus `drawPrimitives`.
+- Zig writes compact quad/frame data into the active frame slot's shared `MTLBuffer`, binds its `gpuAddress` into `MTL4ArgumentTable`, and the Metal vertex shader expands each quad with `vertex_id`.
+- Zig creates the Metal 4 render pass descriptor, command encoder, viewport/scissor, pipeline binding, argument table binding, draw command, queue commit, drawable signal, and present.
 - `src/objc.zig` owns typed `objc_msgSend` wrappers for Objective-C object pointers, `BOOL`, `NSUInteger`, `CGFloat`, `CGSize`, and `CAAutoresizingMask`.
 - `src/objc.zig` also proves Zig can register Objective-C classes with Zig method implementations.
 
@@ -48,9 +49,9 @@ Surface lifetime contract:
 
 - Zig owns the `CAMetalLayer` with an explicit retain and releases it when `zpui_surface_destroy` runs.
 - Objective-C receives the layer as borrowed through `zpui_surface_layer`; it must not transfer or release that object.
-- Zig owns the `MTL4CommandQueue`, `MTL4CommandBuffer`, and `MTL4CommandAllocator` ring; Objective-C receives borrowed pointers for the current Metal 4 render pass.
-- Zig owns allocator and per-frame buffer reuse policy: it waits on `MTLSharedEvent`, resets the frame allocator, writes the active frame buffer, and signals the next frame completion value after queue commit.
-- Zig owns the app residency set for persistent GPU-address resources; Objective-C declares `CAMetalLayer.residencySet` on every command buffer before ending it.
+- Zig owns the `MTL4CommandQueue`, `MTL4CommandBuffer`, and `MTL4CommandAllocator` ring; Objective-C no longer receives command objects.
+- Zig owns allocator and per-frame buffer reuse policy: it waits on `MTLSharedEvent`, resets the frame allocator, writes the active frame-data buffer, encodes the command buffer, and signals the next frame completion value after queue commit.
+- Zig owns the app residency set for persistent GPU-address resources and declares it on every command buffer before ending it.
 - `zpui_surface_destroy` drains the last submitted frame event before releasing GPU-visible objects.
 - Objective-C is responsible for destroying the `ZPUISurface *` handle exactly once after display callbacks have stopped.
 - `makeBackingLayer` must return the same borrowed layer for the view lifetime.
@@ -66,12 +67,14 @@ Removed bootstrap shortcuts:
 - No legacy `MTLCommandQueue`/`MTLCommandBuffer` submission path in current ZPUI rendering.
 - No runtime shader string in the current render path; `build.zig` compiles `src/shaders/solid_quad.metal` into `zig-out/bin/zpui.metallib`.
 - No legacy `setVertexBytes:length:atIndex:` resource binding.
+- No CPU-side quad-to-triangle vertex expansion in the current solid-quad path.
+- No Objective-C render command encoding in the current solid-quad path.
 
 ## Next Steps
 
-1. Move the remaining pipeline creation policy from Objective-C into Zig while keeping the Metal 4 compiler/pipeline descriptor path.
-2. Replace the fixed-capacity packet arrays with a growable per-frame arena and explicit batch offsets.
-3. Add multiple clip/batch encoding instead of drawing the whole prepared vertex range as one batch.
+1. Replace the fixed-capacity packet arrays with a growable per-frame arena and explicit batch offsets.
+2. Add multiple clip/batch encoding instead of drawing the whole prepared vertex range as one batch.
+3. Add an offscreen Metal pixel test for the Zig-owned encoder path.
 4. Make the dirty/continuous frame flags callable from Zig.
 5. Add event callbacks on `ZPUIMetalView` for mouse, keyboard, resize, scale, and close.
 6. Add `NSTextInputClient` hooks later for IME, but keep text rendering on the Metal path.
@@ -84,7 +87,7 @@ The likely migration path is incremental:
 
 1. Keep the working `.m` bridge while proving each Objective-C runtime operation in Zig.
 2. Move selector/class/message wrappers into `src/objc.zig`.
-3. Move renderer/resource ownership into Zig first. Completed slices so far: `CAMetalLayer` creation/configuration/drawable sizing, Metal 4 command queue/buffer/allocator creation, shared-event allocator fencing, per-frame shared vertex buffer creation, app residency set ownership, `MTL4ArgumentTable` binding, checked-in shader compilation, `RenderPacket` v0 solid quads, plus a Zig-owned `Surface` handle with retained Objective-C resources.
+3. Move renderer/resource ownership into Zig first. Completed slices so far: `CAMetalLayer` creation/configuration/drawable sizing, Metal 4 command queue/buffer/allocator creation, shared-event allocator fencing, per-frame shared frame-data buffer creation, app residency set ownership, `MTL4ArgumentTable` binding, checked-in shader compilation, Metal 4 pipeline creation, Metal 4 command encoding/submission/presentation, `RenderPacket` v0 solid quads, and GPU-side quad expansion via `vertex_id`.
 4. Move simple Objective-C object setup into Zig next.
 5. Leave only the hardest AppKit subclass/delegate/text-input pieces in Objective-C until we have enough Zig runtime helpers to replace them cleanly.
 
@@ -94,9 +97,9 @@ Milestone 0 is the native surface kernel. The current direction is deliberately 
 
 - AppKit owns the process, menu, window, and view lifecycle.
 - Zig owns the Metal surface contract, retained native resources, and explicit status-code failures across the C ABI.
-- Objective-C remains a narrow host for AppKit subclassing and the current Metal command encoder.
-- Frame data is dense and C ABI friendly, so the renderer can move toward persistent GPU buffers instead of retained object trees.
-- The next ownership transfer should be moving Metal 4 pipeline setup into Zig.
+- Objective-C remains a narrow host for AppKit subclassing, display-link callbacks, drawable acquisition, and path/URL conveniences.
+- Frame data is dense and GPU-buffer friendly, so the renderer can move toward persistent arenas instead of retained object trees.
+- The next ownership transfer should be dirty/continuous frame control and input events into Zig.
 
 ## Developer Target Profile
 
