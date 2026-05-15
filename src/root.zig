@@ -4,6 +4,7 @@ pub const native = @import("native.zig");
 pub const objc = @import("objc.zig");
 pub const render = @import("render.zig");
 pub const metal = @import("gpu/metal.zig");
+pub const surface = @import("surface.zig");
 
 pub const NativeError = native.NativeError;
 pub const Frame = render.Frame;

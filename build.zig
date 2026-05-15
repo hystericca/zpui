@@ -23,6 +23,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
+    installNativeShaders(b, target);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -54,4 +55,21 @@ fn linkNativeMacOS(b: *std.Build, module: *std.Build.Module, target: std.Build.R
     module.linkFramework("Metal", .{});
     module.linkFramework("QuartzCore", .{});
     module.linkSystemLibrary("objc", .{});
+}
+
+fn installNativeShaders(b: *std.Build, target: std.Build.ResolvedTarget) void {
+    if (target.result.os.tag != .macos) return;
+
+    const compile_shader = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metal", "-c" });
+    compile_shader.addFileArg(b.path("src/native/shaders/zpui_smoke.metal"));
+    compile_shader.addArg("-o");
+    const air = compile_shader.addOutputFileArg("zpui_smoke.air");
+
+    const link_shader = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metallib" });
+    link_shader.addFileArg(air);
+    link_shader.addArg("-o");
+    const metallib = link_shader.addOutputFileArg("zpui.metallib");
+
+    const install_shader = b.addInstallFileWithDir(metallib, .bin, "zpui.metallib");
+    b.getInstallStep().dependOn(&install_shader.step);
 }

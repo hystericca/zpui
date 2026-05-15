@@ -30,8 +30,18 @@ const MsgVoid0 = *const fn (?Id, Sel) callconv(.c) void;
 const MsgInt0 = *const fn (?Id, Sel) callconv(.c) c_int;
 const MsgBool0 = *const fn (?Id, Sel) callconv(.c) BOOL;
 const MsgSize0 = *const fn (?Id, Sel) callconv(.c) CGSize;
+const MsgU64_0 = *const fn (?Id, Sel) callconv(.c) u64;
+const MsgPtr0 = *const fn (?Id, Sel) callconv(.c) ?*anyopaque;
 const MsgVoidId1 = *const fn (?Id, Sel, ?Id) callconv(.c) void;
 const MsgVoidBool1 = *const fn (?Id, Sel, BOOL) callconv(.c) void;
+const MsgBoolISize1 = *const fn (?Id, Sel, isize) callconv(.c) BOOL;
+const MsgBoolU64U64_2 = *const fn (?Id, Sel, u64, u64) callconv(.c) BOOL;
+const MsgIdUSizeUSize2 = *const fn (?Id, Sel, usize, usize) callconv(.c) ?Id;
+const MsgIdIdPtr2 = *const fn (?Id, Sel, ?Id, ?*anyopaque) callconv(.c) ?Id;
+const MsgVoidU64USize2 = *const fn (?Id, Sel, u64, usize) callconv(.c) void;
+const MsgVoidIdUSize2 = *const fn (?Id, Sel, ?Id, usize) callconv(.c) void;
+const MsgVoidIdU64_2 = *const fn (?Id, Sel, ?Id, u64) callconv(.c) void;
+const MsgVoidU64_1 = *const fn (?Id, Sel, u64) callconv(.c) void;
 const MsgVoidUSize1 = *const fn (?Id, Sel, usize) callconv(.c) void;
 const MsgVoidUInt1 = *const fn (?Id, Sel, c_uint) callconv(.c) void;
 const MsgVoidF64_1 = *const fn (?Id, Sel, f64) callconv(.c) void;
@@ -42,8 +52,18 @@ const msg_void_0: MsgVoid0 = @extern(MsgVoid0, .{ .name = "objc_msgSend" });
 const msg_int_0: MsgInt0 = @extern(MsgInt0, .{ .name = "objc_msgSend" });
 const msg_bool_0: MsgBool0 = @extern(MsgBool0, .{ .name = "objc_msgSend" });
 const msg_size_0: MsgSize0 = @extern(MsgSize0, .{ .name = "objc_msgSend" });
+const msg_u64_0: MsgU64_0 = @extern(MsgU64_0, .{ .name = "objc_msgSend" });
+const msg_ptr_0: MsgPtr0 = @extern(MsgPtr0, .{ .name = "objc_msgSend" });
 const msg_void_id_1: MsgVoidId1 = @extern(MsgVoidId1, .{ .name = "objc_msgSend" });
 const msg_void_bool_1: MsgVoidBool1 = @extern(MsgVoidBool1, .{ .name = "objc_msgSend" });
+const msg_bool_isize_1: MsgBoolISize1 = @extern(MsgBoolISize1, .{ .name = "objc_msgSend" });
+const msg_bool_u64_u64_2: MsgBoolU64U64_2 = @extern(MsgBoolU64U64_2, .{ .name = "objc_msgSend" });
+const msg_id_usize_usize_2: MsgIdUSizeUSize2 = @extern(MsgIdUSizeUSize2, .{ .name = "objc_msgSend" });
+const msg_id_id_ptr_2: MsgIdIdPtr2 = @extern(MsgIdIdPtr2, .{ .name = "objc_msgSend" });
+const msg_void_u64_usize_2: MsgVoidU64USize2 = @extern(MsgVoidU64USize2, .{ .name = "objc_msgSend" });
+const msg_void_id_usize_2: MsgVoidIdUSize2 = @extern(MsgVoidIdUSize2, .{ .name = "objc_msgSend" });
+const msg_void_id_u64_2: MsgVoidIdU64_2 = @extern(MsgVoidIdU64_2, .{ .name = "objc_msgSend" });
+const msg_void_u64_1: MsgVoidU64_1 = @extern(MsgVoidU64_1, .{ .name = "objc_msgSend" });
 const msg_void_usize_1: MsgVoidUSize1 = @extern(MsgVoidUSize1, .{ .name = "objc_msgSend" });
 const msg_void_uint_1: MsgVoidUInt1 = @extern(MsgVoidUInt1, .{ .name = "objc_msgSend" });
 const msg_void_f64_1: MsgVoidF64_1 = @extern(MsgVoidF64_1, .{ .name = "objc_msgSend" });
@@ -93,8 +113,48 @@ pub fn sendSize0(receiver: ?Id, op: Sel) CGSize {
     return msg_size_0(receiver, op);
 }
 
+pub fn sendU64_0(receiver: ?Id, op: Sel) u64 {
+    return msg_u64_0(receiver, op);
+}
+
+pub fn sendPtr0(receiver: ?Id, op: Sel) ?*anyopaque {
+    return msg_ptr_0(receiver, op);
+}
+
 pub fn sendVoidId(receiver: ?Id, op: Sel, arg: ?Id) void {
     msg_void_id_1(receiver, op, arg);
+}
+
+pub fn sendBoolISize(receiver: ?Id, op: Sel, arg: isize) bool {
+    return msg_bool_isize_1(receiver, op, arg) != 0;
+}
+
+pub fn sendBoolU64U64(receiver: ?Id, op: Sel, arg0: u64, arg1: u64) bool {
+    return msg_bool_u64_u64_2(receiver, op, arg0, arg1) != 0;
+}
+
+pub fn sendIdUSizeUSize(receiver: ?Id, op: Sel, arg0: usize, arg1: usize) ?Id {
+    return msg_id_usize_usize_2(receiver, op, arg0, arg1);
+}
+
+pub fn sendIdIdPtr(receiver: ?Id, op: Sel, arg0: ?Id, arg1: ?*anyopaque) ?Id {
+    return msg_id_id_ptr_2(receiver, op, arg0, arg1);
+}
+
+pub fn sendVoidU64USize(receiver: ?Id, op: Sel, arg0: u64, arg1: usize) void {
+    msg_void_u64_usize_2(receiver, op, arg0, arg1);
+}
+
+pub fn sendVoidIdUSize(receiver: ?Id, op: Sel, arg0: ?Id, arg1: usize) void {
+    msg_void_id_usize_2(receiver, op, arg0, arg1);
+}
+
+pub fn sendVoidIdU64(receiver: ?Id, op: Sel, arg0: ?Id, arg1: u64) void {
+    msg_void_id_u64_2(receiver, op, arg0, arg1);
+}
+
+pub fn sendVoidU64(receiver: ?Id, op: Sel, arg: u64) void {
+    msg_void_u64_1(receiver, op, arg);
 }
 
 pub fn sendVoidBool(receiver: ?Id, op: Sel, arg: bool) void {

@@ -1,9 +1,12 @@
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <mach-o/dyld.h>
 #import <stdatomic.h>
 #import <stdint.h>
 #import <stdio.h>
+#import <stdlib.h>
+#import <string.h>
 
 typedef struct {
     float position[4];
@@ -17,9 +20,25 @@ typedef struct {
     ZPUIVertex vertices[3];
 } ZPUIFrame;
 
+typedef struct {
+    double clearColor[4];
+    uint32_t vertexCount;
+    uint32_t reserved[3];
+} ZPUIPreparedFrame;
+
+typedef struct ZPUISurface ZPUISurface;
+
 extern void zpui_build_frame(ZPUIFrame *frame);
-extern int zpui_metal_create_layer(id device, void **outLayer);
-extern int zpui_metal_resize_layer(CAMetalLayer *layer, double width, double height, double scale);
+extern int zpui_surface_create(id device, ZPUISurface **outSurface);
+extern void zpui_surface_destroy(ZPUISurface *surface);
+extern CAMetalLayer *zpui_surface_layer(ZPUISurface *surface);
+extern id<MTL4CommandQueue> zpui_surface_mtl4_command_queue(ZPUISurface *surface);
+extern id<MTL4CommandBuffer> zpui_surface_mtl4_command_buffer(ZPUISurface *surface);
+extern id<MTL4CommandAllocator> zpui_surface_next_mtl4_command_allocator(ZPUISurface *surface);
+extern int zpui_surface_signal_frame_completion(ZPUISurface *surface);
+extern id<MTL4ArgumentTable> zpui_surface_argument_table(ZPUISurface *surface);
+extern int zpui_surface_prepare_frame(ZPUISurface *surface, ZPUIPreparedFrame *preparedFrame);
+extern int zpui_surface_resize(ZPUISurface *surface, double width, double height, double scale);
 
 static const char *zpui_native_status_name(int status) {
     switch (status) {
@@ -28,16 +47,86 @@ static const char *zpui_native_status_name(int status) {
     case 10:
         return "invalid device";
     case 11:
-        return "invalid layer";
+        return "invalid surface";
     case 12:
         return "missing Objective-C class";
     case 13:
         return "missing Objective-C selector";
     case 14:
         return "layer allocation failed";
+    case 15:
+        return "retain failed";
+    case 16:
+        return "out of memory";
+    case 17:
+        return "command queue creation failed";
+    case 18:
+        return "unsupported device for ZPUI developer target";
+    case 19:
+        return "command allocator creation failed";
+    case 20:
+        return "command buffer creation failed";
+    case 21:
+        return "buffer creation failed";
+    case 22:
+        return "buffer contents unavailable";
+    case 23:
+        return "argument table descriptor creation failed";
+    case 24:
+        return "argument table creation failed";
+    case 25:
+        return "shared event creation failed";
+    case 26:
+        return "residency set descriptor creation failed";
+    case 27:
+        return "residency set creation failed";
     default:
         return "unknown native error";
     }
+}
+
+static NSURL *zpui_metallib_url(void) {
+    uint32_t pathLength = 0;
+    _NSGetExecutablePath(NULL, &pathLength);
+
+    char *path = malloc(pathLength);
+    if (path == NULL) {
+        return nil;
+    }
+    if (_NSGetExecutablePath(path, &pathLength) != 0) {
+        free(path);
+        return nil;
+    }
+
+    NSString *executablePath =
+        [[NSFileManager defaultManager] stringWithFileSystemRepresentation:path
+                                                                    length:strlen(path)];
+    free(path);
+    if (executablePath == nil) {
+        return nil;
+    }
+
+    NSString *executableDirectory = [executablePath stringByDeletingLastPathComponent];
+    NSString *metallibPath = [executableDirectory stringByAppendingPathComponent:@"zpui.metallib"];
+    return [NSURL fileURLWithPath:metallibPath];
+}
+
+static id<MTLLibrary> zpui_new_shader_library(id<MTLDevice> device, NSError **error) {
+    NSURL *metallibURL = zpui_metallib_url();
+    id<MTLLibrary> library = nil;
+    if (metallibURL != nil) {
+        library = [device newLibraryWithURL:metallibURL error:error];
+        if (library != nil) {
+            return library;
+        }
+    }
+
+    NSString *runDirectoryPath = [[NSFileManager defaultManager] currentDirectoryPath];
+    NSString *installedMetallibPath =
+        [[runDirectoryPath stringByAppendingPathComponent:@"zig-out/bin"]
+            stringByAppendingPathComponent:@"zpui.metallib"];
+    NSURL *installedMetallibURL = [NSURL fileURLWithPath:installedMetallibPath];
+    return [device newLibraryWithURL:installedMetallibURL error:error];
 }
 
 @protocol ZPUIWindowSurface <NSObject>
@@ -100,16 +189,19 @@ static const char *zpui_native_status_name(int status) {
 static ZPUIAppDelegate *zpuiAppDelegate = nil;
 
 @interface ZPUIRenderer : NSObject
-@property(nonatomic, strong, readonly) CAMetalLayer *layer;
 - (instancetype)initWithDevice:(id<MTLDevice>)device;
+- (CAMetalLayer *)layer;
 - (void)resizeToDrawableSize:(CGSize)drawableSize scale:(CGFloat)scale;
-- (void)drawFrame;
-- (void)drawFrameWithTransaction:(BOOL)presentsWithTransaction;
+- (BOOL)drawFrame;
+- (BOOL)drawFrameWithTransaction:(BOOL)presentsWithTransaction;
 @end
 
 @implementation ZPUIRenderer {
     id<MTLDevice> _device;
-    id<MTLCommandQueue> _commandQueue;
+    ZPUISurface *_surface;
+    __unsafe_unretained id<MTL4CommandQueue> _commandQueue;
+    __unsafe_unretained id<MTL4CommandBuffer> _commandBuffer;
+    __unsafe_unretained id<MTL4ArgumentTable> _argumentTable;
     id<MTLRenderPipelineState> _pipelineState;
 }
 
@@ -117,114 +209,176 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     self = [super init];
     if (self) {
         _device = device;
-        _commandQueue = [device newCommandQueue];
-        void *layer = NULL;
-        int layerStatus = zpui_metal_create_layer(device, &layer);
-        if (layerStatus != 0 || layer == NULL) {
-            fprintf(stderr, "ZPUI: failed to create CAMetalLayer in Zig: %s (%d)\n",
-                    zpui_native_status_name(layerStatus), layerStatus);
+        int surfaceStatus = zpui_surface_create(device, &_surface);
+        if (surfaceStatus != 0 || _surface == NULL) {
+            fprintf(stderr, "ZPUI: failed to create surface in Zig: %s (%d)\n",
+                    zpui_native_status_name(surfaceStatus), surfaceStatus);
             return nil;
         }
-        _layer = (__bridge CAMetalLayer *)layer;
+
+        CAMetalLayer *layer = [self layer];
+        _commandQueue = zpui_surface_mtl4_command_queue(_surface);
+        _commandBuffer = zpui_surface_mtl4_command_buffer(_surface);
+        _argumentTable = zpui_surface_argument_table(_surface);
+        if (_commandQueue == nil) {
+            fprintf(stderr, "ZPUI: surface returned no command queue.\n");
+            zpui_surface_destroy(_surface);
+            _surface = NULL;
+            return nil;
+        }
+        if (_commandBuffer == nil) {
+            fprintf(stderr, "ZPUI: surface returned no command buffer.\n");
+            zpui_surface_destroy(_surface);
+            _surface = NULL;
+            return nil;
+        }
+        if (_argumentTable == nil) {
+            fprintf(stderr, "ZPUI: surface returned no argument table.\n");
+            zpui_surface_destroy(_surface);
+            _surface = NULL;
+            return nil;
+        }
 
         NSError *error = nil;
-        NSString *source =
-            @"#include <metal_stdlib>\n"
-             "using namespace metal;\n"
-             "struct ZPUIVertex { float4 position; float4 color; };\n"
-             "struct VertexOut { float4 position [[position]]; float4 color; };\n"
-             "vertex VertexOut zpui_vertex(uint vertex_id [[vertex_id]],\n"
-             "                             const device ZPUIVertex *vertices [[buffer(0)]]) {\n"
-             "    VertexOut out;\n"
-             "    out.position = vertices[vertex_id].position;\n"
-             "    out.color = vertices[vertex_id].color;\n"
-             "    return out;\n"
-             "}\n"
-             "fragment float4 zpui_fragment(VertexOut vert [[stage_in]]) {\n"
-             "    return vert.color;\n"
-             "}\n";
-        id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+        id<MTLLibrary> library = zpui_new_shader_library(device, &error);
         if (library == nil) {
-            fprintf(stderr, "ZPUI: failed to compile Metal library: %s\n",
+            fprintf(stderr, "ZPUI: failed to load Metal library: %s\n",
                     error.localizedDescription.UTF8String);
+            zpui_surface_destroy(_surface);
+            _surface = NULL;
             return nil;
         }
 
-        MTLRenderPipelineDescriptor *pipelineDescriptor =
-            [[MTLRenderPipelineDescriptor alloc] init];
-        pipelineDescriptor.vertexFunction = [library newFunctionWithName:@"zpui_vertex"];
-        pipelineDescriptor.fragmentFunction = [library newFunctionWithName:@"zpui_fragment"];
-        pipelineDescriptor.colorAttachments[0].pixelFormat = _layer.pixelFormat;
+        id<MTL4Compiler> compiler =
+            [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+        if (compiler == nil) {
+            fprintf(stderr, "ZPUI: failed to create Metal 4 compiler: %s\n",
+                    error.localizedDescription.UTF8String);
+            zpui_surface_destroy(_surface);
+            _surface = NULL;
+            return nil;
+        }
 
-        _pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDescriptor
-                                                                error:&error];
+        MTL4LibraryFunctionDescriptor *vertexFunction = [MTL4LibraryFunctionDescriptor new];
+        vertexFunction.library = library;
+        vertexFunction.name = @"zpui_vertex";
+        MTL4LibraryFunctionDescriptor *fragmentFunction = [MTL4LibraryFunctionDescriptor new];
+        fragmentFunction.library = library;
+        fragmentFunction.name = @"zpui_fragment";
+
+        MTL4RenderPipelineDescriptor *pipelineDescriptor = [MTL4RenderPipelineDescriptor new];
+        pipelineDescriptor.vertexFunctionDescriptor = vertexFunction;
+        pipelineDescriptor.fragmentFunctionDescriptor = fragmentFunction;
+        pipelineDescriptor.colorAttachments[0].pixelFormat = layer.pixelFormat;
+
+        _pipelineState = [compiler newRenderPipelineStateWithDescriptor:pipelineDescriptor
+                                                    compilerTaskOptions:nil
+                                                                  error:&error];
         if (_pipelineState == nil) {
             fprintf(stderr, "ZPUI: failed to create render pipeline: %s\n",
                     error.localizedDescription.UTF8String);
+            zpui_surface_destroy(_surface);
+            _surface = NULL;
             return nil;
         }
     }
     return self;
 }
 
+- (CAMetalLayer *)layer {
+    return zpui_surface_layer(_surface);
+}
+
 - (void)resizeToDrawableSize:(CGSize)drawableSize scale:(CGFloat)scale {
-    int status = zpui_metal_resize_layer(_layer, drawableSize.width, drawableSize.height, scale);
+    int status = zpui_surface_resize(_surface, drawableSize.width, drawableSize.height, scale);
     if (status != 0) {
-        fprintf(stderr, "ZPUI: failed to resize CAMetalLayer in Zig: %s (%d)\n",
+        fprintf(stderr, "ZPUI: failed to resize surface in Zig: %s (%d)\n",
                 zpui_native_status_name(status), status);
     }
 }
 
-- (void)drawFrame {
-    [self drawFrameWithTransaction:NO];
+- (BOOL)drawFrame {
+    return [self drawFrameWithTransaction:NO];
 }
 
-- (void)drawFrameWithTransaction:(BOOL)presentsWithTransaction {
-    if (_layer.drawableSize.width <= 0 || _layer.drawableSize.height <= 0) {
-        return;
+- (BOOL)drawFrameWithTransaction:(BOOL)presentsWithTransaction {
+    CAMetalLayer *layer = [self layer];
+    if (layer == nil || layer.drawableSize.width <= 0 || layer.drawableSize.height <= 0) {
+        return YES;
     }
 
-    const BOOL previousPresentsWithTransaction = _layer.presentsWithTransaction;
-    _layer.presentsWithTransaction = presentsWithTransaction;
+    const BOOL previousPresentsWithTransaction = layer.presentsWithTransaction;
+    layer.presentsWithTransaction = presentsWithTransaction;
 
-    id<CAMetalDrawable> drawable = [_layer nextDrawable];
-    if (drawable == nil) {
-        _layer.presentsWithTransaction = previousPresentsWithTransaction;
-        return;
+    id<MTL4CommandAllocator> allocator = zpui_surface_next_mtl4_command_allocator(_surface);
+    if (allocator == nil || _commandQueue == nil || _commandBuffer == nil) {
+        layer.presentsWithTransaction = previousPresentsWithTransaction;
+        return NO;
     }
 
-    ZPUIFrame frame = {0};
-    zpui_build_frame(&frame);
+    ZPUIPreparedFrame frame = {0};
+    int prepareStatus = zpui_surface_prepare_frame(_surface, &frame);
+    if (prepareStatus != 0) {
+        fprintf(stderr, "ZPUI: failed to prepare frame in Zig: %s (%d)\n",
+                zpui_native_status_name(prepareStatus), prepareStatus);
+        layer.presentsWithTransaction = previousPresentsWithTransaction;
+        return YES;
+    }
     if (frame.vertexCount == 0 || frame.vertexCount > 3) {
-        _layer.presentsWithTransaction = previousPresentsWithTransaction;
-        return;
+        layer.presentsWithTransaction = previousPresentsWithTransaction;
+        return YES;
     }
 
-    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+    id<CAMetalDrawable> drawable = [layer nextDrawable];
+    if (drawable == nil) {
+        layer.presentsWithTransaction = previousPresentsWithTransaction;
+        return NO;
+    }
+
+    MTL4RenderPassDescriptor *pass = [[MTL4RenderPassDescriptor alloc] init];
     pass.colorAttachments[0].texture = drawable.texture;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(
         frame.clearColor[0], frame.clearColor[1], frame.clearColor[2], frame.clearColor[3]);
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-    id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
-    id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+    [_commandBuffer beginCommandBufferWithAllocator:allocator];
+    id<MTL4RenderCommandEncoder> encoder =
+        [_commandBuffer renderCommandEncoderWithDescriptor:pass];
+    if (encoder == nil) {
+        [_commandBuffer endCommandBuffer];
+        layer.presentsWithTransaction = previousPresentsWithTransaction;
+        return NO;
+    }
     [encoder setRenderPipelineState:_pipelineState];
-    [encoder setVertexBytes:frame.vertices length:sizeof(frame.vertices) atIndex:0];
+    [encoder setArgumentTable:_argumentTable atStages:MTLRenderStageVertex];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle
                 vertexStart:0
                 vertexCount:(NSUInteger)frame.vertexCount];
     [encoder endEncoding];
-
-    if (presentsWithTransaction) {
-        [commandBuffer commit];
-        [commandBuffer waitUntilScheduled];
-        [drawable present];
-    } else {
-        [commandBuffer presentDrawable:drawable];
-        [commandBuffer commit];
+    if (layer.residencySet != nil) {
+        [_commandBuffer useResidencySet:layer.residencySet];
     }
-    _layer.presentsWithTransaction = previousPresentsWithTransaction;
+    [_commandBuffer endCommandBuffer];
+
+    id<MTL4CommandBuffer> commandBuffers[] = { _commandBuffer };
+    [_commandQueue waitForDrawable:drawable];
+    [_commandQueue commit:commandBuffers count:1];
+    int signalStatus = zpui_surface_signal_frame_completion(_surface);
+    if (signalStatus != 0) {
+        fprintf(stderr, "ZPUI: failed to signal frame completion: %s (%d)\n",
+                zpui_native_status_name(signalStatus), signalStatus);
+    }
+    [_commandQueue signalDrawable:drawable];
+    [drawable present];
+
+    layer.presentsWithTransaction = previousPresentsWithTransaction;
+    return YES;
+}
+
+- (void)dealloc {
+    zpui_surface_destroy(_surface);
+    _surface = NULL;
 }
 
 @end
@@ -236,7 +390,7 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
 - (void)setContinuousFrames:(BOOL)enabled;
 - (void)startDisplayLink;
 - (void)stopDisplayLink;
-- (void)drawFrame;
+- (BOOL)drawFrame;
 @end
 
 @implementation ZPUIMetalView {
@@ -299,7 +453,9 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     [self stopDisplayLink];
     atomic_store_explicit(&_needsFrame, false, memory_order_release);
     [self updateDrawableSize];
-    [_renderer drawFrameWithTransaction:YES];
+    if (![_renderer drawFrameWithTransaction:YES]) {
+        atomic_store_explicit(&_needsFrame, true, memory_order_release);
+    }
     if (_continuousFrames || atomic_load_explicit(&_needsFrame, memory_order_acquire)) {
         [self startDisplayLink];
     }
@@ -351,9 +507,9 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     _displayLink = nil;
 }
 
-- (void)drawFrame {
+- (BOOL)drawFrame {
     [self updateDrawableSize];
-    [_renderer drawFrame];
+    return [_renderer drawFrame];
 }
 
 - (void)displayLinkTick:(CADisplayLink *)displayLink {
@@ -366,7 +522,9 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
 
     const bool needsFrame = atomic_exchange_explicit(&_needsFrame, false, memory_order_acq_rel);
     if (_continuousFrames || needsFrame) {
-        [self drawFrame];
+        if (![self drawFrame]) {
+            atomic_store_explicit(&_needsFrame, true, memory_order_release);
+        }
     }
 
     if (!_continuousFrames && !atomic_load_explicit(&_needsFrame, memory_order_acquire)) {
