@@ -1,4 +1,5 @@
 const builtin = @import("builtin");
+const metal = @import("gpu/metal.zig");
 const render = @import("render.zig");
 
 pub const NativeError = error{
@@ -8,6 +9,11 @@ pub const NativeError = error{
 };
 
 extern fn zpui_run_macos_hello_window() c_int;
+
+comptime {
+    _ = metal.zpui_metal_create_layer;
+    _ = metal.zpui_metal_resize_layer;
+}
 
 export fn zpui_build_frame(frame: *render.Frame) void {
     render.buildFrame(frame);

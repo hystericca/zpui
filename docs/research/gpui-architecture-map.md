@@ -126,7 +126,7 @@ To remake something like Zed, ZPUI eventually needs these capabilities:
 
 1. Example-first API sketches: `hello_world`, button/counter, text input, and uniform list.
 2. Core entity arena: typed handles, weak handles, generations, context-gated mutation, and notifications.
-3. Native macOS window skeleton: AppKit run loop, window lifecycle, frame scheduling, events, and a Metal drawable.
+3. Native macOS surface kernel: AppKit run loop, window lifecycle, explicit Objective-C runtime bindings, Zig-owned `CAMetalLayer` setup, frame scheduling, events, and a Metal drawable.
 4. Element lifecycle: request layout, prepaint, paint, frame-local state, hitboxes, focus IDs, and scene primitive arrays.
 5. Action and focus dispatch: key contexts, action listeners, bubbling, and mouse hit dispatch.
 6. Text MVP: shaping, glyph cache, atlas upload, text runs, cursor bounds, and basic IME hooks.

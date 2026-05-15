@@ -1,9 +1,9 @@
 #import <Cocoa/Cocoa.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <stdatomic.h>
 #import <stdint.h>
 #import <stdio.h>
-#import <stdatomic.h>
 
 typedef struct {
     float position[4];
@@ -18,6 +18,27 @@ typedef struct {
 } ZPUIFrame;
 
 extern void zpui_build_frame(ZPUIFrame *frame);
+extern int zpui_metal_create_layer(id device, void **outLayer);
+extern int zpui_metal_resize_layer(CAMetalLayer *layer, double width, double height, double scale);
+
+static const char *zpui_native_status_name(int status) {
+    switch (status) {
+    case 0:
+        return "ok";
+    case 10:
+        return "invalid device";
+    case 11:
+        return "invalid layer";
+    case 12:
+        return "missing Objective-C class";
+    case 13:
+        return "missing Objective-C selector";
+    case 14:
+        return "layer allocation failed";
+    default:
+        return "unknown native error";
+    }
+}
 
 @protocol ZPUIWindowSurface <NSObject>
 - (void)requestFrame;
@@ -97,17 +118,14 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     if (self) {
         _device = device;
         _commandQueue = [device newCommandQueue];
-        _layer = [CAMetalLayer layer];
-        _layer.device = device;
-        _layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        _layer.framebufferOnly = YES;
-        _layer.opaque = YES;
-        _layer.maximumDrawableCount = 3;
-        _layer.presentsWithTransaction = NO;
-        _layer.allowsNextDrawableTimeout = NO;
-        _layer.displaySyncEnabled = YES;
-        _layer.needsDisplayOnBoundsChange = YES;
-        _layer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+        void *layer = NULL;
+        int layerStatus = zpui_metal_create_layer(device, &layer);
+        if (layerStatus != 0 || layer == NULL) {
+            fprintf(stderr, "ZPUI: failed to create CAMetalLayer in Zig: %s (%d)\n",
+                    zpui_native_status_name(layerStatus), layerStatus);
+            return nil;
+        }
+        _layer = (__bridge CAMetalLayer *)layer;
 
         NSError *error = nil;
         NSString *source =
@@ -127,18 +145,22 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
              "}\n";
         id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
         if (library == nil) {
-            fprintf(stderr, "ZPUI: failed to compile Metal library: %s\n", error.localizedDescription.UTF8String);
+            fprintf(stderr, "ZPUI: failed to compile Metal library: %s\n",
+                    error.localizedDescription.UTF8String);
             return nil;
         }
 
-        MTLRenderPipelineDescriptor *pipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        MTLRenderPipelineDescriptor *pipelineDescriptor =
+            [[MTLRenderPipelineDescriptor alloc] init];
         pipelineDescriptor.vertexFunction = [library newFunctionWithName:@"zpui_vertex"];
         pipelineDescriptor.fragmentFunction = [library newFunctionWithName:@"zpui_fragment"];
         pipelineDescriptor.colorAttachments[0].pixelFormat = _layer.pixelFormat;
 
-        _pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDescriptor error:&error];
+        _pipelineState = [device newRenderPipelineStateWithDescriptor:pipelineDescriptor
+                                                                error:&error];
         if (_pipelineState == nil) {
-            fprintf(stderr, "ZPUI: failed to create render pipeline: %s\n", error.localizedDescription.UTF8String);
+            fprintf(stderr, "ZPUI: failed to create render pipeline: %s\n",
+                    error.localizedDescription.UTF8String);
             return nil;
         }
     }
@@ -146,8 +168,11 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
 }
 
 - (void)resizeToDrawableSize:(CGSize)drawableSize scale:(CGFloat)scale {
-    _layer.contentsScale = scale;
-    _layer.drawableSize = drawableSize;
+    int status = zpui_metal_resize_layer(_layer, drawableSize.width, drawableSize.height, scale);
+    if (status != 0) {
+        fprintf(stderr, "ZPUI: failed to resize CAMetalLayer in Zig: %s (%d)\n",
+                zpui_native_status_name(status), status);
+    }
 }
 
 - (void)drawFrame {
@@ -179,17 +204,16 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     pass.colorAttachments[0].texture = drawable.texture;
     pass.colorAttachments[0].loadAction = MTLLoadActionClear;
     pass.colorAttachments[0].clearColor = MTLClearColorMake(
-        frame.clearColor[0],
-        frame.clearColor[1],
-        frame.clearColor[2],
-        frame.clearColor[3]);
+        frame.clearColor[0], frame.clearColor[1], frame.clearColor[2], frame.clearColor[3]);
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
     id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
     id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setVertexBytes:frame.vertices length:sizeof(frame.vertices) atIndex:0];
-    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:(NSUInteger)frame.vertexCount];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle
+                vertexStart:0
+                vertexCount:(NSUInteger)frame.vertexCount];
     [encoder endEncoding];
 
     if (presentsWithTransaction) {
@@ -334,8 +358,7 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
 
 - (void)displayLinkTick:(CADisplayLink *)displayLink {
     (void)displayLink;
-    if (self.window == nil ||
-        ![self.window isVisible] ||
+    if (self.window == nil || ![self.window isVisible] ||
         ([self.window occlusionState] & NSWindowOcclusionStateVisible) == 0) {
         [self stopDisplayLink];
         return;
@@ -364,10 +387,9 @@ static void zpui_install_menu(void) {
     [NSApp setMainMenu:menuBar];
 
     NSMenu *appMenu = [[NSMenu alloc] initWithTitle:@"ZPUI"];
-    NSMenuItem *quitItem = [[NSMenuItem alloc]
-        initWithTitle:@"Quit ZPUI"
-        action:@selector(terminate:)
-        keyEquivalent:@"q"];
+    NSMenuItem *quitItem = [[NSMenuItem alloc] initWithTitle:@"Quit ZPUI"
+                                                      action:@selector(terminate:)
+                                               keyEquivalent:@"q"];
     [appMenu addItem:quitItem];
     [appMenuItem setSubmenu:appMenu];
 }
@@ -387,17 +409,14 @@ int zpui_run_macos_hello_window(void) {
         }
 
         const NSRect frame = NSMakeRect(0, 0, 960, 600);
-        const NSWindowStyleMask style =
-            NSWindowStyleMaskTitled |
-            NSWindowStyleMaskClosable |
-            NSWindowStyleMaskMiniaturizable |
-            NSWindowStyleMaskResizable;
+        const NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                        NSWindowStyleMaskMiniaturizable |
+                                        NSWindowStyleMaskResizable;
 
-        ZPUIWindow *window = [[ZPUIWindow alloc]
-            initWithContentRect:frame
-            styleMask:style
-            backing:NSBackingStoreBuffered
-            defer:NO];
+        ZPUIWindow *window = [[ZPUIWindow alloc] initWithContentRect:frame
+                                                           styleMask:style
+                                                             backing:NSBackingStoreBuffered
+                                                               defer:NO];
         if (window == nil) {
             return 1;
         }
@@ -406,7 +425,8 @@ int zpui_run_macos_hello_window(void) {
         window.releasedWhenClosed = NO;
         [window center];
 
-        ZPUIMetalView *metalView = [[ZPUIMetalView alloc] initWithFrame:window.contentView.bounds device:device];
+        ZPUIMetalView *metalView = [[ZPUIMetalView alloc] initWithFrame:window.contentView.bounds
+                                                                 device:device];
         if (metalView == nil) {
             return 1;
         }

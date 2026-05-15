@@ -8,6 +8,16 @@ pub const Class = *Object;
 pub const Sel = *Selector;
 pub const Imp = *const anyopaque;
 pub const ObjCBool = c_char;
+pub const BOOL = ObjCBool;
+pub const CGFloat = f64;
+pub const CGSize = extern struct {
+    width: CGFloat,
+    height: CGFloat,
+};
+pub const NSSize = CGSize;
+pub const NSUInteger = usize;
+pub const NSInteger = isize;
+pub const CAAutoresizingMask = c_uint;
 
 extern fn objc_getClass(name: [*:0]const u8) ?Class;
 extern fn objc_allocateClassPair(superclass: ?Class, name: [*:0]const u8, extra_bytes: usize) ?Class;
@@ -15,13 +25,33 @@ extern fn objc_registerClassPair(cls: Class) void;
 extern fn sel_registerName(name: [*:0]const u8) ?Sel;
 extern fn class_addMethod(cls: Class, name: Sel, imp: Imp, types: [*:0]const u8) ObjCBool;
 
-const MsgId0 = *const fn (?Id, Sel, ...) callconv(.c) ?Id;
-const MsgVoid0 = *const fn (?Id, Sel, ...) callconv(.c) void;
-const MsgInt0 = *const fn (?Id, Sel, ...) callconv(.c) c_int;
+const MsgId0 = *const fn (?Id, Sel) callconv(.c) ?Id;
+const MsgVoid0 = *const fn (?Id, Sel) callconv(.c) void;
+const MsgInt0 = *const fn (?Id, Sel) callconv(.c) c_int;
+const MsgBool0 = *const fn (?Id, Sel) callconv(.c) BOOL;
+const MsgSize0 = *const fn (?Id, Sel) callconv(.c) CGSize;
+const MsgVoidId1 = *const fn (?Id, Sel, ?Id) callconv(.c) void;
+const MsgVoidBool1 = *const fn (?Id, Sel, BOOL) callconv(.c) void;
+const MsgVoidUSize1 = *const fn (?Id, Sel, usize) callconv(.c) void;
+const MsgVoidUInt1 = *const fn (?Id, Sel, c_uint) callconv(.c) void;
+const MsgVoidF64_1 = *const fn (?Id, Sel, f64) callconv(.c) void;
+const MsgVoidSize1 = *const fn (?Id, Sel, CGSize) callconv(.c) void;
 
 const msg_id_0: MsgId0 = @extern(MsgId0, .{ .name = "objc_msgSend" });
 const msg_void_0: MsgVoid0 = @extern(MsgVoid0, .{ .name = "objc_msgSend" });
 const msg_int_0: MsgInt0 = @extern(MsgInt0, .{ .name = "objc_msgSend" });
+const msg_bool_0: MsgBool0 = @extern(MsgBool0, .{ .name = "objc_msgSend" });
+const msg_size_0: MsgSize0 = @extern(MsgSize0, .{ .name = "objc_msgSend" });
+const msg_void_id_1: MsgVoidId1 = @extern(MsgVoidId1, .{ .name = "objc_msgSend" });
+const msg_void_bool_1: MsgVoidBool1 = @extern(MsgVoidBool1, .{ .name = "objc_msgSend" });
+const msg_void_usize_1: MsgVoidUSize1 = @extern(MsgVoidUSize1, .{ .name = "objc_msgSend" });
+const msg_void_uint_1: MsgVoidUInt1 = @extern(MsgVoidUInt1, .{ .name = "objc_msgSend" });
+const msg_void_f64_1: MsgVoidF64_1 = @extern(MsgVoidF64_1, .{ .name = "objc_msgSend" });
+const msg_void_size_1: MsgVoidSize1 = @extern(MsgVoidSize1, .{ .name = "objc_msgSend" });
+
+pub fn toObjCBool(value: bool) BOOL {
+    return if (value) 1 else 0;
+}
 
 pub fn getClass(name: [*:0]const u8) ?Class {
     return objc_getClass(name);
@@ -53,6 +83,38 @@ pub fn sendVoid0(receiver: ?Id, op: Sel) void {
 
 pub fn sendInt0(receiver: ?Id, op: Sel) c_int {
     return msg_int_0(receiver, op);
+}
+
+pub fn sendBool0(receiver: ?Id, op: Sel) bool {
+    return msg_bool_0(receiver, op) != 0;
+}
+
+pub fn sendSize0(receiver: ?Id, op: Sel) CGSize {
+    return msg_size_0(receiver, op);
+}
+
+pub fn sendVoidId(receiver: ?Id, op: Sel, arg: ?Id) void {
+    msg_void_id_1(receiver, op, arg);
+}
+
+pub fn sendVoidBool(receiver: ?Id, op: Sel, arg: bool) void {
+    msg_void_bool_1(receiver, op, toObjCBool(arg));
+}
+
+pub fn sendVoidUSize(receiver: ?Id, op: Sel, arg: usize) void {
+    msg_void_usize_1(receiver, op, arg);
+}
+
+pub fn sendVoidUInt(receiver: ?Id, op: Sel, arg: c_uint) void {
+    msg_void_uint_1(receiver, op, arg);
+}
+
+pub fn sendVoidF64(receiver: ?Id, op: Sel, arg: f64) void {
+    msg_void_f64_1(receiver, op, arg);
+}
+
+pub fn sendVoidSize(receiver: ?Id, op: Sel, arg: CGSize) void {
+    msg_void_size_1(receiver, op, arg);
 }
 
 fn testAnswer(_: ?Id, _: Sel) callconv(.c) c_int {
