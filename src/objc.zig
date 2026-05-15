@@ -194,7 +194,7 @@ test "objc runtime can message Cocoa objects directly from Zig" {
 
 test "objc runtime can register a class backed by a Zig IMP" {
     const ns_object = getClass("NSObject") orelse return error.MissingNSObject;
-    const class_name = "ZPUIObjCRuntimeSmokeTest";
+    const class_name = "ZPUIObjCRuntimeTestClass";
 
     const cls = getClass(class_name) orelse blk: {
         const allocated = allocateClass(ns_object, class_name, 0) orelse return error.ClassAllocationFailed;

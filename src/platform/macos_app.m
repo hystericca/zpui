@@ -8,27 +8,21 @@
 #import <stdlib.h>
 #import <string.h>
 
-typedef struct {
-    float position[4];
-    float color[4];
-} ZPUIVertex;
+#define ZPUI_MAX_FRAME_VERTICES 48
 
 typedef struct {
     double clearColor[4];
     uint32_t vertexCount;
-    uint32_t reserved[3];
-    ZPUIVertex vertices[3];
-} ZPUIFrame;
-
-typedef struct {
-    double clearColor[4];
-    uint32_t vertexCount;
-    uint32_t reserved[3];
+    uint32_t batchCount;
+    uint32_t scissorX;
+    uint32_t scissorY;
+    uint32_t scissorWidth;
+    uint32_t scissorHeight;
+    uint32_t reserved[2];
 } ZPUIPreparedFrame;
 
 typedef struct ZPUISurface ZPUISurface;
 
-extern void zpui_build_frame(ZPUIFrame *frame);
 extern int zpui_surface_create(id device, ZPUISurface **outSurface);
 extern void zpui_surface_destroy(ZPUISurface *surface);
 extern CAMetalLayer *zpui_surface_layer(ZPUISurface *surface);
@@ -37,10 +31,10 @@ extern id<MTL4CommandBuffer> zpui_surface_mtl4_command_buffer(ZPUISurface *surfa
 extern id<MTL4CommandAllocator> zpui_surface_next_mtl4_command_allocator(ZPUISurface *surface);
 extern int zpui_surface_signal_frame_completion(ZPUISurface *surface);
 extern id<MTL4ArgumentTable> zpui_surface_argument_table(ZPUISurface *surface);
-extern int zpui_surface_prepare_frame(ZPUISurface *surface, ZPUIPreparedFrame *preparedFrame);
 extern int zpui_surface_resize(ZPUISurface *surface, double width, double height, double scale);
+extern int zpui_demo_prepare_frame(ZPUISurface *surface, ZPUIPreparedFrame *preparedFrame);
 
-static const char *zpui_native_status_name(int status) {
+static const char *zpui_platform_status_name(int status) {
     switch (status) {
     case 0:
         return "ok";
@@ -80,8 +74,10 @@ static const char *zpui_native_status_name(int status) {
         return "residency set descriptor creation failed";
     case 27:
         return "residency set creation failed";
+    case 28:
+        return "frame encoding failed";
     default:
-        return "unknown native error";
+        return "unknown platform error";
     }
 }
 
@@ -212,7 +208,7 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
         int surfaceStatus = zpui_surface_create(device, &_surface);
         if (surfaceStatus != 0 || _surface == NULL) {
             fprintf(stderr, "ZPUI: failed to create surface in Zig: %s (%d)\n",
-                    zpui_native_status_name(surfaceStatus), surfaceStatus);
+                    zpui_platform_status_name(surfaceStatus), surfaceStatus);
             return nil;
         }
 
@@ -249,8 +245,8 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
             return nil;
         }
 
-        id<MTL4Compiler> compiler =
-            [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new] error:&error];
+        id<MTL4Compiler> compiler = [device newCompilerWithDescriptor:[MTL4CompilerDescriptor new]
+                                                                error:&error];
         if (compiler == nil) {
             fprintf(stderr, "ZPUI: failed to create Metal 4 compiler: %s\n",
                     error.localizedDescription.UTF8String);
@@ -293,7 +289,7 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     int status = zpui_surface_resize(_surface, drawableSize.width, drawableSize.height, scale);
     if (status != 0) {
         fprintf(stderr, "ZPUI: failed to resize surface in Zig: %s (%d)\n",
-                zpui_native_status_name(status), status);
+                zpui_platform_status_name(status), status);
     }
 }
 
@@ -317,14 +313,15 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     }
 
     ZPUIPreparedFrame frame = {0};
-    int prepareStatus = zpui_surface_prepare_frame(_surface, &frame);
+    int prepareStatus = zpui_demo_prepare_frame(_surface, &frame);
     if (prepareStatus != 0) {
         fprintf(stderr, "ZPUI: failed to prepare frame in Zig: %s (%d)\n",
-                zpui_native_status_name(prepareStatus), prepareStatus);
+                zpui_platform_status_name(prepareStatus), prepareStatus);
         layer.presentsWithTransaction = previousPresentsWithTransaction;
         return YES;
     }
-    if (frame.vertexCount == 0 || frame.vertexCount > 3) {
+    if (frame.vertexCount == 0 || frame.batchCount == 0 ||
+        frame.vertexCount > ZPUI_MAX_FRAME_VERTICES) {
         layer.presentsWithTransaction = previousPresentsWithTransaction;
         return YES;
     }
@@ -343,13 +340,28 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
     [_commandBuffer beginCommandBufferWithAllocator:allocator];
-    id<MTL4RenderCommandEncoder> encoder =
-        [_commandBuffer renderCommandEncoderWithDescriptor:pass];
+    id<MTL4RenderCommandEncoder> encoder = [_commandBuffer renderCommandEncoderWithDescriptor:pass];
     if (encoder == nil) {
         [_commandBuffer endCommandBuffer];
         layer.presentsWithTransaction = previousPresentsWithTransaction;
         return NO;
     }
+    MTLViewport viewport = {
+        .originX = 0.0,
+        .originY = 0.0,
+        .width = layer.drawableSize.width,
+        .height = layer.drawableSize.height,
+        .znear = 0.0,
+        .zfar = 1.0,
+    };
+    [encoder setViewport:viewport];
+    MTLScissorRect scissor = {
+        .x = frame.scissorX,
+        .y = frame.scissorY,
+        .width = frame.scissorWidth,
+        .height = frame.scissorHeight,
+    };
+    [encoder setScissorRect:scissor];
     [encoder setRenderPipelineState:_pipelineState];
     [encoder setArgumentTable:_argumentTable atStages:MTLRenderStageVertex];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle
@@ -361,13 +373,13 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     }
     [_commandBuffer endCommandBuffer];
 
-    id<MTL4CommandBuffer> commandBuffers[] = { _commandBuffer };
+    id<MTL4CommandBuffer> commandBuffers[] = {_commandBuffer};
     [_commandQueue waitForDrawable:drawable];
     [_commandQueue commit:commandBuffers count:1];
     int signalStatus = zpui_surface_signal_frame_completion(_surface);
     if (signalStatus != 0) {
         fprintf(stderr, "ZPUI: failed to signal frame completion: %s (%d)\n",
-                zpui_native_status_name(signalStatus), signalStatus);
+                zpui_platform_status_name(signalStatus), signalStatus);
     }
     [_commandQueue signalDrawable:drawable];
     [drawable present];

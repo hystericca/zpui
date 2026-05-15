@@ -23,6 +23,7 @@ pub const Error = error{
     ResidencySetDescriptorCreationFailed,
     ResidencySetCreationFailed,
     SharedEventCreationFailed,
+    FrameEncodingFailed,
     RetainFailed,
     OutOfMemory,
 };
@@ -41,8 +42,25 @@ const FrameResources = struct {
 pub const PreparedFrame = extern struct {
     clear_color: [4]f64,
     vertex_count: u32,
-    reserved: [3]u32 = .{ 0, 0, 0 },
+    batch_count: u32,
+    scissor_x: u32,
+    scissor_y: u32,
+    scissor_width: u32,
+    scissor_height: u32,
+    reserved: [2]u32 = .{ 0, 0 },
 };
+
+pub fn emptyPreparedFrame() PreparedFrame {
+    return .{
+        .clear_color = .{ 0, 0, 0, 1 },
+        .vertex_count = 0,
+        .batch_count = 0,
+        .scissor_x = 0,
+        .scissor_y = 0,
+        .scissor_width = 0,
+        .scissor_height = 0,
+    };
+}
 
 pub const Status = enum(c_int) {
     ok = 0,
@@ -64,6 +82,7 @@ pub const Status = enum(c_int) {
     shared_event_creation_failed = 25,
     residency_set_descriptor_creation_failed = 26,
     residency_set_creation_failed = 27,
+    frame_encoding_failed = 28,
 
     pub fn fromError(err: Error) Status {
         return switch (err) {
@@ -83,6 +102,7 @@ pub const Status = enum(c_int) {
             Error.ResidencySetDescriptorCreationFailed => .residency_set_descriptor_creation_failed,
             Error.ResidencySetCreationFailed => .residency_set_creation_failed,
             Error.SharedEventCreationFailed => .shared_event_creation_failed,
+            Error.FrameEncodingFailed => .frame_encoding_failed,
             Error.RetainFailed => .retain_failed,
             Error.OutOfMemory => .out_of_memory,
         };
@@ -238,22 +258,32 @@ pub const Surface = struct {
         surface.current_frame_index +%= 1;
     }
 
-    pub fn prepareFrame(surface: *Surface, prepared: *PreparedFrame) Error!void {
-        var frame: render.Frame = undefined;
-        render.buildFrame(&frame);
-
-        if (frame.vertex_count > vertex_buffer_capacity) return Error.BufferCreationFailed;
+    pub fn preparePacket(surface: *Surface, packet: *const render.RenderPacket, prepared: *PreparedFrame) Error!void {
+        var vertices: [render.max_vertices]render.Vertex = undefined;
+        const compiled = render.compilePacket(packet, &vertices) catch return Error.FrameEncodingFailed;
+        if (compiled.vertex_count > vertex_buffer_capacity) return Error.BufferCreationFailed;
 
         const frame_slot = surface.currentFrameSlot();
         const frame_resource = surface.frame_resources[frame_slot];
-        const byte_len = @as(usize, frame.vertex_count) * @sizeOf(render.Vertex);
-        const frame_vertices: [*]const u8 = @ptrCast(&frame.vertices);
+        const byte_len = @as(usize, compiled.vertex_count) * @sizeOf(render.Vertex);
+        const frame_vertices: [*]const u8 = @ptrCast(&vertices);
         @memcpy(frame_resource.vertex_buffer_contents[0..byte_len], frame_vertices[0..byte_len]);
         try metal.bindArgumentTableBufferAddress(surface.argument_table, frame_resource.vertex_buffer_gpu_address, 0);
 
+        const clip = if (packet.clip_count > 0) packet.clips[0] else render.ClipRect{
+            .x = 0,
+            .y = 0,
+            .width = 0,
+            .height = 0,
+        };
         prepared.* = .{
-            .clear_color = frame.clear_color,
-            .vertex_count = frame.vertex_count,
+            .clear_color = packet.clear_color,
+            .vertex_count = compiled.vertex_count,
+            .batch_count = packet.batch_count,
+            .scissor_x = clip.x,
+            .scissor_y = clip.y,
+            .scissor_width = clip.width,
+            .scissor_height = clip.height,
         };
     }
 
@@ -340,15 +370,6 @@ pub export fn zpui_surface_argument_table(surface: ?*Surface) ?objc.Id {
     return unwrapped_surface.argument_table;
 }
 
-pub export fn zpui_surface_prepare_frame(surface: ?*Surface, prepared: *PreparedFrame) c_int {
-    prepared.* = .{ .clear_color = .{ 0, 0, 0, 1 }, .vertex_count = 0 };
-    const unwrapped_surface = surface orelse return @intFromEnum(Status.invalid_surface);
-    unwrapped_surface.prepareFrame(prepared) catch |err| {
-        return @intFromEnum(Status.fromError(err));
-    };
-    return @intFromEnum(Status.ok);
-}
-
 pub export fn zpui_surface_resize(surface: ?*Surface, width: f64, height: f64, scale: f64) c_int {
     const unwrapped_surface = surface orelse return @intFromEnum(Status.invalid_surface);
     unwrapped_surface.resize(
@@ -360,9 +381,40 @@ pub export fn zpui_surface_resize(surface: ?*Surface, width: f64, height: f64, s
     return @intFromEnum(Status.ok);
 }
 
+test "prepared frame layout stays stable across the Objective-C ABI" {
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(PreparedFrame));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(PreparedFrame, "clear_color"));
+    try std.testing.expectEqual(@as(usize, 32), @offsetOf(PreparedFrame, "vertex_count"));
+    try std.testing.expectEqual(@as(usize, 36), @offsetOf(PreparedFrame, "batch_count"));
+    try std.testing.expectEqual(@as(usize, 40), @offsetOf(PreparedFrame, "scissor_x"));
+    try std.testing.expectEqual(@as(usize, 44), @offsetOf(PreparedFrame, "scissor_y"));
+    try std.testing.expectEqual(@as(usize, 48), @offsetOf(PreparedFrame, "scissor_width"));
+    try std.testing.expectEqual(@as(usize, 52), @offsetOf(PreparedFrame, "scissor_height"));
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(PreparedFrame, "reserved"));
+}
+
+test "empty prepared frame has neutral draw defaults" {
+    const prepared = emptyPreparedFrame();
+    try std.testing.expectEqual([4]f64{ 0, 0, 0, 1 }, prepared.clear_color);
+    try std.testing.expectEqual(@as(u32, 0), prepared.vertex_count);
+    try std.testing.expectEqual(@as(u32, 0), prepared.batch_count);
+    try std.testing.expectEqual(@as(u32, 0), prepared.scissor_width);
+    try std.testing.expectEqual(@as(u32, 0), prepared.scissor_height);
+}
+
 test "surface status values stay stable across the Objective-C ABI" {
     try std.testing.expectEqual(@as(c_int, 0), @intFromEnum(Status.ok));
     try std.testing.expectEqual(@as(c_int, 10), @intFromEnum(Status.invalid_device));
-    try std.testing.expectEqual(@as(c_int, 27), @intFromEnum(Status.residency_set_creation_failed));
-    try std.testing.expectEqual(@as(usize, 96), vertex_buffer_byte_len);
+    try std.testing.expectEqual(@as(c_int, 28), @intFromEnum(Status.frame_encoding_failed));
+    try std.testing.expectEqual(Status.invalid_device, Status.fromError(Error.InvalidDevice));
+    try std.testing.expectEqual(Status.invalid_surface, Status.fromError(Error.InvalidSurface));
+    try std.testing.expectEqual(Status.unsupported_device, Status.fromError(Error.UnsupportedDevice));
+    try std.testing.expectEqual(Status.frame_encoding_failed, Status.fromError(Error.FrameEncodingFailed));
+    try std.testing.expectEqual(Status.out_of_memory, Status.fromError(Error.OutOfMemory));
+}
+
+test "surface vertex buffer capacity matches the render packet contract" {
+    try std.testing.expectEqual(@as(usize, render.max_vertices), vertex_buffer_capacity);
+    try std.testing.expectEqual(@as(usize, 1536), vertex_buffer_byte_len);
+    try std.testing.expectEqual(@sizeOf(render.Vertex) * vertex_buffer_capacity, vertex_buffer_byte_len);
 }
