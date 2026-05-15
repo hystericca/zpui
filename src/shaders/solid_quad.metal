@@ -21,7 +21,7 @@ struct ZPUIFrameData {
     float2 drawable_size;
     uint quad_count;
     uint reserved;
-    ZPUIQuad quads[8];
+    ZPUIQuad quads[128];
 };
 
 struct ZPUIVertexOut {

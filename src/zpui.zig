@@ -14,5 +14,5 @@ pub const runHelloWindow = platform.macos.runHelloWindow;
 test {
     const std = @import("std");
     std.testing.refAllDecls(@This());
-    _ = @import("demo/solid_quads.zig");
+    _ = @import("demo/workspace_shell.zig");
 }

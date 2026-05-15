@@ -1,7 +1,7 @@
 const builtin = @import("builtin");
 const mtl = @import("zmtl4");
 const render = @import("../render.zig");
-const solid_quads = @import("../demo/solid_quads.zig");
+const workspace_shell = @import("../demo/workspace_shell.zig");
 const surface = @import("../surface.zig");
 
 pub const Error = error{
@@ -24,7 +24,7 @@ export fn zpui_demo_draw_frame(surface_handle: ?*surface.Surface, drawable: mtl.
     const unwrapped_surface = surface_handle orelse return @intFromEnum(surface.Status.invalid_surface);
 
     var packet: render.RenderPacket = undefined;
-    solid_quads.buildPacket(&packet, .{
+    workspace_shell.buildPacket(&packet, .{
         @floatCast(unwrapped_surface.drawable_size.width),
         @floatCast(unwrapped_surface.drawable_size.height),
     }) catch return @intFromEnum(surface.Status.frame_encoding_failed);

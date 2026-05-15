@@ -486,6 +486,5 @@ test "surface clip validation rejects scissors outside the drawable" {
 
 test "surface frame buffer capacity matches the render packet contract" {
     try std.testing.expectEqual(@as(usize, render.max_quads), frame_quad_cap);
-    try std.testing.expectEqual(@as(usize, 400), frame_buf_len);
     try std.testing.expectEqual(@sizeOf(render.GpuFrameData), frame_buf_len);
 }

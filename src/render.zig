@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const max_quads = 8;
+pub const max_quads = 128;
 pub const max_batches = 1;
 pub const max_clips = 1;
 pub const vertices_per_quad = 6;
@@ -58,13 +58,13 @@ comptime {
     std.debug.assert(@sizeOf(ClipRect) == 16);
     std.debug.assert(@sizeOf(Quad) == 48);
     std.debug.assert(@sizeOf(Batch) == 16);
-    std.debug.assert(@sizeOf(RenderPacket) == 472);
+    std.debug.assert(@sizeOf(RenderPacket) == renderPacketByteLen());
     std.debug.assert(@offsetOf(RenderPacket, "clear_color") == 0);
     std.debug.assert(@offsetOf(RenderPacket, "drawable_size") == 32);
     std.debug.assert(@offsetOf(RenderPacket, "quads") == 56);
-    std.debug.assert(@offsetOf(RenderPacket, "batches") == 440);
-    std.debug.assert(@offsetOf(RenderPacket, "clips") == 456);
-    std.debug.assert(@sizeOf(GpuFrameData) == 400);
+    std.debug.assert(@offsetOf(RenderPacket, "batches") == batchOffset());
+    std.debug.assert(@offsetOf(RenderPacket, "clips") == clipOffset());
+    std.debug.assert(@sizeOf(GpuFrameData) == gpuFrameDataByteLen(max_quads));
     std.debug.assert(@offsetOf(GpuFrameData, "drawable_size") == 0);
     std.debug.assert(@offsetOf(GpuFrameData, "quad_count") == 8);
     std.debug.assert(@offsetOf(GpuFrameData, "quads") == 16);
@@ -161,6 +161,18 @@ pub fn gpuFrameDataByteLen(quad_count: u32) usize {
     return @offsetOf(GpuFrameData, "quads") + @as(usize, @intCast(quad_count)) * @sizeOf(Quad);
 }
 
+pub fn renderPacketByteLen() usize {
+    return clipOffset() + @sizeOf(ClipRect) * max_clips;
+}
+
+fn batchOffset() usize {
+    return @offsetOf(RenderPacket, "quads") + @sizeOf(Quad) * max_quads;
+}
+
+fn clipOffset() usize {
+    return batchOffset() + @sizeOf(Batch) * max_batches;
+}
+
 fn drawableClip(drawable_size: [2]f32) ClipRect {
     return .{
         .x = 0,
@@ -181,21 +193,21 @@ test "render packet and GPU frame layouts stay stable" {
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(ClipRect));
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(Quad));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(Batch));
-    try std.testing.expectEqual(@as(usize, 400), @sizeOf(GpuFrameData));
+    try std.testing.expectEqual(gpuFrameDataByteLen(max_quads), @sizeOf(GpuFrameData));
 
-    try std.testing.expectEqual(@as(usize, 472), @sizeOf(RenderPacket));
+    try std.testing.expectEqual(renderPacketByteLen(), @sizeOf(RenderPacket));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(RenderPacket, "clear_color"));
     try std.testing.expectEqual(@as(usize, 32), @offsetOf(RenderPacket, "drawable_size"));
     try std.testing.expectEqual(@as(usize, 56), @offsetOf(RenderPacket, "quads"));
-    try std.testing.expectEqual(@as(usize, 440), @offsetOf(RenderPacket, "batches"));
-    try std.testing.expectEqual(@as(usize, 456), @offsetOf(RenderPacket, "clips"));
+    try std.testing.expectEqual(batchOffset(), @offsetOf(RenderPacket, "batches"));
+    try std.testing.expectEqual(clipOffset(), @offsetOf(RenderPacket, "clips"));
 
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(GpuFrameData, "drawable_size"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(GpuFrameData, "quad_count"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(GpuFrameData, "quads"));
     try std.testing.expectEqual(@as(usize, 16), gpuFrameDataByteLen(0));
     try std.testing.expectEqual(@as(usize, 64), gpuFrameDataByteLen(1));
-    try std.testing.expectEqual(@as(usize, 400), gpuFrameDataByteLen(max_quads));
+    try std.testing.expectEqual(@sizeOf(GpuFrameData), gpuFrameDataByteLen(max_quads));
 }
 
 test "solid quad compiler emits compact GPU frame data" {

@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    const run_step = b.step("run", "Run the ZPUI solid quad demo");
+    const run_step = b.step("run", "Run the ZPUI workspace shell demo");
     run_step.dependOn(&run_cmd.step);
 
     const mod_tests = b.addTest(.{ .root_module = zpui });
