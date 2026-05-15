@@ -19,7 +19,7 @@ pub const Error = mtl.Error || error{
 
 pub const max_frames_in_flight = 3;
 pub const frame_quad_cap = render.max_quads;
-pub const frame_buf_len = @sizeOf(render.GpuFrameData);
+pub const frame_buf_len = @sizeOf(render.FrameData);
 const frame_wait_timeout_ms = 10;
 const frame_drain_timeout_ms = 5_000;
 
@@ -35,7 +35,6 @@ const Draw = struct {
     clear_color: mtl.abi.ClearColor,
     draw_vertex_count: u32,
     batch_count: u32,
-    scissor: render.ClipRect,
 };
 
 pub const Status = enum(c_int) {
@@ -282,10 +281,10 @@ pub const Surface = struct {
         surface.current_frame_index +%= 1;
     }
 
-    pub fn drawPacket(surface: *Surface, packet: *const render.RenderPacket, drawable_id: ObjCId) Error!void {
+    pub fn drawScene(surface: *Surface, scene: *const render.Scene, drawable_id: ObjCId) Error!void {
         const drawable = mtl.layer.Drawable.fromRaw(drawable_id orelse return Error.DrawableUnavailable);
         const command_allocator = try surface.nextCommandAllocator();
-        const prepared = try surface.preparePacket(packet);
+        const prepared = try surface.prepareScene(scene);
         const drawable_texture = try mtl.layer.drawableTexture(drawable);
         var pass_descriptor = try mtl.render.createColorPassDescriptor(drawable_texture, prepared.clear_color);
         defer pass_descriptor.deinit();
@@ -308,15 +307,23 @@ pub const Surface = struct {
         });
 
         if (prepared.draw_vertex_count > 0 and prepared.batch_count > 0) {
-            mtl.render.setScissorRect(encoder, .{
-                .x = prepared.scissor.x,
-                .y = prepared.scissor.y,
-                .width = prepared.scissor.width,
-                .height = prepared.scissor.height,
-            });
             mtl.render.setPipelineState(encoder, surface.pipeline_state.ref());
             mtl.render.setArgumentTable(encoder, surface.argument_table.ref(), mtl.abi.render_stage_vertex);
-            mtl.render.drawTriangles(encoder, @intCast(prepared.draw_vertex_count));
+            for (scene.batches) |batch| {
+                const clip = scene.clips[@intCast(batch.clip_index)];
+                mtl.render.setScissorRect(encoder, .{
+                    .x = clip.x,
+                    .y = clip.y,
+                    .width = clip.width,
+                    .height = clip.height,
+                });
+                mtl.render.drawPrimitives(
+                    encoder,
+                    .triangle,
+                    @intCast(batch.vertex_start),
+                    @intCast(batch.vertex_count),
+                );
+            }
         }
 
         mtl.render.endEncoding(encoder);
@@ -331,32 +338,28 @@ pub const Surface = struct {
         mtl.layer.present(drawable);
     }
 
-    fn preparePacket(surface: *Surface, packet: *const render.RenderPacket) Error!Draw {
-        var frame_data: render.GpuFrameData = undefined;
-        const compiled = render.compilePacket(packet, &frame_data) catch return Error.FrameEncodingFailed;
+    fn prepareScene(surface: *Surface, scene: *const render.Scene) Error!Draw {
+        var frame_data: render.FrameData = undefined;
+        const compiled = render.compileScene(scene, &frame_data) catch return Error.FrameEncodingFailed;
         if (compiled.quad_count > frame_quad_cap) return Error.BufferCreationFailed;
 
         const frame_slot = surface.currentFrameSlot();
-        const frame = surface.frames[frame_slot];
+        const frame = &surface.frames[frame_slot];
         const frame_bytes: [*]const u8 = @ptrCast(&frame_data);
-        const byte_len = render.gpuFrameDataByteLen(compiled.quad_count);
+        const byte_len = render.frameDataByteLen(compiled.quad_count);
         @memcpy(frame.bytes[0..byte_len], frame_bytes[0..byte_len]);
         mtl.resource.setAddress(surface.argument_table.ref(), frame.addr, 0);
 
-        const clip = if (packet.clip_count > 0) packet.clips[0] else render.ClipRect{
-            .x = 0,
-            .y = 0,
-            .width = 0,
-            .height = 0,
-        };
-        if (compiled.draw_vertex_count > 0 and packet.batch_count > 0) {
-            try validateClipRect(clip, surface.drawable_size);
+        if (compiled.draw_vertex_count > 0 and compiled.batch_count > 0) {
+            for (scene.batches) |batch| {
+                const clip = scene.clips[@intCast(batch.clip_index)];
+                try validateClipRect(clip, surface.drawable_size);
+            }
         }
         return .{
-            .clear_color = toClearColor(packet.clear_color),
+            .clear_color = toClearColor(scene.clear_color),
             .draw_vertex_count = compiled.draw_vertex_count,
-            .batch_count = packet.batch_count,
-            .scissor = clip,
+            .batch_count = compiled.batch_count,
         };
     }
 
@@ -484,7 +487,7 @@ test "surface clip validation rejects scissors outside the drawable" {
     try std.testing.expectError(Error.InvalidDrawableSize, validateClipRect(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{ .width = 0, .height = 480 }));
 }
 
-test "surface frame buffer capacity matches the render packet contract" {
+test "surface frame buffer capacity matches the scene contract" {
     try std.testing.expectEqual(@as(usize, render.max_quads), frame_quad_cap);
-    try std.testing.expectEqual(@sizeOf(render.GpuFrameData), frame_buf_len);
+    try std.testing.expectEqual(@sizeOf(render.FrameData), frame_buf_len);
 }

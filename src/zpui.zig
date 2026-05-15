@@ -1,5 +1,3 @@
-//! Public entry points for the ZPUI prototype.
-
 pub const render = @import("render.zig");
 pub const metal = @import("zmtl4");
 pub const platform = struct {
@@ -8,7 +6,10 @@ pub const platform = struct {
 pub const surface = @import("surface.zig");
 
 pub const PlatformError = platform.macos.Error;
-pub const RenderPacket = render.RenderPacket;
+pub const FrameData = render.FrameData;
+pub const Scene = render.Scene;
+pub const SceneBuilder = render.SceneBuilder;
+pub const SceneStorage = render.SceneStorage;
 pub const runHelloWindow = platform.macos.runHelloWindow;
 
 test {

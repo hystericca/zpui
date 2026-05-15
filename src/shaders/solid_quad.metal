@@ -11,10 +11,6 @@ struct ZPUIRect {
 struct ZPUIQuad {
     ZPUIRect rect;
     float4 color;
-    uint clip_index;
-    uint reserved0;
-    uint reserved1;
-    uint reserved2;
 };
 
 struct ZPUIFrameData {

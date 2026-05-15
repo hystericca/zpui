@@ -23,13 +23,13 @@ comptime {
 export fn zpui_demo_draw_frame(surface_handle: ?*surface.Surface, drawable: mtl.runtime.Id) c_int {
     const unwrapped_surface = surface_handle orelse return @intFromEnum(surface.Status.invalid_surface);
 
-    var packet: render.RenderPacket = undefined;
-    workspace_shell.buildPacket(&packet, .{
+    var storage: render.SceneStorage = undefined;
+    const scene = workspace_shell.buildScene(&storage, .{
         @floatCast(unwrapped_surface.drawable_size.width),
         @floatCast(unwrapped_surface.drawable_size.height),
     }) catch return @intFromEnum(surface.Status.frame_encoding_failed);
 
-    unwrapped_surface.drawPacket(&packet, drawable) catch |err| {
+    unwrapped_surface.drawScene(&scene, drawable) catch |err| {
         return @intFromEnum(surface.Status.fromError(err));
     };
     return @intFromEnum(surface.Status.ok);
