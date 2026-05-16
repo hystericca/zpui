@@ -1,6 +1,7 @@
 pub const frame = @import("frame.zig");
 pub const render = @import("render.zig");
 pub const metal = @import("zmtl4");
+pub const ui = @import("ui.zig");
 pub const platform = struct {
     pub const macos = @import("platform/macos.zig");
 };
