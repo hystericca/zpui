@@ -5,7 +5,9 @@ pub const max_quads = 128;
 pub const max_batches = 32;
 pub const max_clips = 32;
 pub const vertices_per_quad = 6;
+pub const vertices_per_glyph = 6;
 pub const max_draw_vertices = max_quads * vertices_per_quad;
+pub const max_text_vertices = text.max_frame_glyphs * vertices_per_glyph;
 
 pub const Color = [4]f32;
 pub const ClearColor = [4]f64;
@@ -65,15 +67,26 @@ pub const FrameData = extern struct {
     quads: [max_quads]GpuQuad,
 };
 
+pub const TextFrameData = extern struct {
+    drawable_size: [2]f32,
+    glyph_count: u32,
+    reserved: u32 = 0,
+    glyphs: [text.max_frame_glyphs]text.GlyphInstance,
+};
+
 comptime {
     std.debug.assert(@sizeOf(Rect) == 16);
     std.debug.assert(@sizeOf(ClipRect) == 16);
     std.debug.assert(@sizeOf(GpuQuad) == 32);
     std.debug.assert(@sizeOf(Batch) == 16);
     std.debug.assert(@sizeOf(FrameData) == frameDataByteLen(max_quads));
+    std.debug.assert(@sizeOf(TextFrameData) == textFrameDataByteLen(text.max_frame_glyphs));
     std.debug.assert(@offsetOf(FrameData, "drawable_size") == 0);
     std.debug.assert(@offsetOf(FrameData, "quad_count") == 8);
     std.debug.assert(@offsetOf(FrameData, "quads") == 16);
+    std.debug.assert(@offsetOf(TextFrameData, "drawable_size") == 0);
+    std.debug.assert(@offsetOf(TextFrameData, "glyph_count") == 8);
+    std.debug.assert(@offsetOf(TextFrameData, "glyphs") == 16);
 }
 
 pub const SceneBuildError = error{
@@ -95,6 +108,7 @@ pub const CompileError = error{
     QuadCapacityExceeded,
     BatchCapacityExceeded,
     ClipCapacityExceeded,
+    GlyphCapacityExceeded,
     BatchClipMismatch,
 };
 
@@ -102,6 +116,11 @@ pub const CompileResult = struct {
     draw_vertex_count: u32,
     quad_count: u32,
     batch_count: u32,
+};
+
+pub const TextCompileResult = struct {
+    draw_vertex_count: u32,
+    glyph_count: u32,
 };
 
 pub const SceneBuilder = struct {
@@ -241,8 +260,28 @@ pub fn compileScene(scene: *const Scene, frame_data: *FrameData) CompileError!Co
     };
 }
 
+pub fn compileText(scene: *const Scene, frame_data: *TextFrameData) CompileError!TextCompileResult {
+    if (scene.glyphs.len > text.max_frame_glyphs) return CompileError.GlyphCapacityExceeded;
+
+    frame_data.drawable_size = scene.drawable_size;
+    frame_data.glyph_count = @intCast(scene.glyphs.len);
+    frame_data.reserved = 0;
+    for (scene.glyphs, 0..) |glyph, i| {
+        frame_data.glyphs[i] = glyph;
+    }
+
+    return .{
+        .draw_vertex_count = @intCast(scene.glyphs.len * vertices_per_glyph),
+        .glyph_count = @intCast(scene.glyphs.len),
+    };
+}
+
 pub fn frameDataByteLen(quad_count: u32) usize {
     return @offsetOf(FrameData, "quads") + @as(usize, @intCast(quad_count)) * @sizeOf(GpuQuad);
+}
+
+pub fn textFrameDataByteLen(glyph_count: u32) usize {
+    return @offsetOf(TextFrameData, "glyphs") + @as(usize, @intCast(glyph_count)) * @sizeOf(text.GlyphInstance);
 }
 
 fn drawableClip(drawable_size: [2]f32) ClipRect {
@@ -267,6 +306,7 @@ test "scene and GPU frame layouts stay stable" {
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(GpuQuad));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(Batch));
     try std.testing.expectEqual(frameDataByteLen(max_quads), @sizeOf(FrameData));
+    try std.testing.expectEqual(textFrameDataByteLen(text.max_frame_glyphs), @sizeOf(TextFrameData));
 
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(FrameData, "drawable_size"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(FrameData, "quad_count"));
@@ -274,6 +314,13 @@ test "scene and GPU frame layouts stay stable" {
     try std.testing.expectEqual(@as(usize, 16), frameDataByteLen(0));
     try std.testing.expectEqual(@as(usize, 48), frameDataByteLen(1));
     try std.testing.expectEqual(@sizeOf(FrameData), frameDataByteLen(max_quads));
+
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(TextFrameData, "drawable_size"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(TextFrameData, "glyph_count"));
+    try std.testing.expectEqual(@as(usize, 16), @offsetOf(TextFrameData, "glyphs"));
+    try std.testing.expectEqual(@as(usize, 16), textFrameDataByteLen(0));
+    try std.testing.expectEqual(@as(usize, 64), textFrameDataByteLen(1));
+    try std.testing.expectEqual(@sizeOf(TextFrameData), textFrameDataByteLen(text.max_frame_glyphs));
 }
 
 test "scene builder records multiple batches and clips" {
@@ -320,6 +367,38 @@ test "scene compiler emits compact GPU frame data" {
     try std.testing.expectEqual(@as(u32, 1), frame_data.quad_count);
     try std.testing.expectEqual(scene.quads[0].rect, frame_data.quads[0].rect);
     try std.testing.expectEqual(scene.quads[0].color, frame_data.quads[0].color);
+}
+
+test "text compiler emits compact glyph frame data" {
+    var glyphs = [_]text.GlyphInstance{.{
+        .rect = .{ .x = 10.0, .y = 12.0, .width = 7.0, .height = 9.0 },
+        .atlas_rect = .{ .x = 0.125, .y = 0.25, .width = 0.03125, .height = 0.0625 },
+        .color = .{ .r = 0.7, .g = 0.8, .b = 0.9, .a = 1.0 },
+    }};
+    var scene: Scene = .{
+        .clear_color = .{ 0, 0, 0, 1 },
+        .drawable_size = .{ 640.0, 480.0 },
+        .quads = &.{},
+        .batches = &.{},
+        .clips = &.{},
+        .glyphs = glyphs[0..],
+        .font = null,
+    };
+
+    var frame_data: TextFrameData = undefined;
+    const result = try compileText(&scene, &frame_data);
+
+    try std.testing.expectEqual(@as(u32, vertices_per_glyph), result.draw_vertex_count);
+    try std.testing.expectEqual(@as(u32, 1), result.glyph_count);
+    try std.testing.expectEqual([2]f32{ 640.0, 480.0 }, frame_data.drawable_size);
+    try std.testing.expectEqual(@as(u32, 1), frame_data.glyph_count);
+    try std.testing.expectEqual(glyphs[0], frame_data.glyphs[0]);
+    try std.testing.expectEqual(@as(usize, 64), textFrameDataByteLen(result.glyph_count));
+
+    scene.glyphs = &.{};
+    const empty = try compileText(&scene, &frame_data);
+    try std.testing.expectEqual(@as(u32, 0), empty.draw_vertex_count);
+    try std.testing.expectEqual(@as(u32, 0), empty.glyph_count);
 }
 
 test "scene builder rejects invalid geometry and capacity overflow" {

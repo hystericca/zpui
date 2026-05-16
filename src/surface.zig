@@ -23,21 +23,32 @@ pub const Error = mtl.Error || error{
 pub const max_frames_in_flight = 3;
 pub const frame_quad_cap = render.max_quads;
 pub const frame_buf_len = @sizeOf(render.FrameData);
+pub const text_frame_buf_len = @sizeOf(render.TextFrameData);
 const frame_wait_timeout_ms = 10;
 const frame_drain_timeout_ms = 5_000;
+const residency_allocation_cap = max_frames_in_flight * 2 + 1;
 
 extern fn zpui_platform_create_shader_library(device: ObjCId) ObjCId;
 
 const GpuFrame = struct {
     buf: mtl.resource.OwnedBuffer,
-    bytes: [*]u8,
+    data: *render.FrameData,
     addr: mtl.abi.GPUAddress,
+    text_buf: mtl.resource.OwnedBuffer,
+    text_data: *render.TextFrameData,
+    text_addr: mtl.abi.GPUAddress,
+
+    fn deinit(frame: *GpuFrame) void {
+        frame.text_buf.deinit();
+        frame.buf.deinit();
+    }
 };
 
 const Draw = struct {
     clear_color: mtl.abi.ClearColor,
     draw_vertex_count: u32,
     batch_count: u32,
+    text_vertex_count: u32,
 };
 
 pub const Status = enum(c_int) {
@@ -82,6 +93,11 @@ pub const Status = enum(c_int) {
     drawable_unavailable = 47,
     too_many_items = 48,
     font_atlas_creation_failed = 49,
+    texture_descriptor_creation_failed = 50,
+    texture_creation_failed = 51,
+    invalid_texture_size = 52,
+    sampler_descriptor_creation_failed = 53,
+    sampler_state_creation_failed = 54,
 
     pub fn fromError(err: Error) Status {
         return switch (err) {
@@ -98,6 +114,11 @@ pub const Status = enum(c_int) {
             Error.CommandEncoderCreationFailed => .render_encoder_creation_failed,
             Error.BufferCreationFailed => .buffer_creation_failed,
             Error.BufferContentsUnavailable => .buffer_contents_unavailable,
+            Error.TextureDescriptorCreationFailed => .texture_descriptor_creation_failed,
+            Error.TextureCreationFailed => .texture_creation_failed,
+            Error.InvalidTextureSize => .invalid_texture_size,
+            Error.SamplerDescriptorCreationFailed => .sampler_descriptor_creation_failed,
+            Error.SamplerStateCreationFailed => .sampler_state_creation_failed,
             Error.ArgumentTableDescriptorCreationFailed => .argument_table_descriptor_creation_failed,
             Error.ArgumentTableCreationFailed => .argument_table_creation_failed,
             Error.ResidencySetDescriptorCreationFailed => .residency_set_descriptor_creation_failed,
@@ -134,11 +155,14 @@ pub const Surface = struct {
     command_queue: mtl.command.OwnedCommandQueue,
     command_buffer: mtl.command.OwnedCommandBuffer,
     pipeline_state: mtl.render.OwnedRenderPipelineState,
+    text_pipeline_state: mtl.render.OwnedRenderPipelineState,
     command_allocators: [max_frames_in_flight]mtl.command.OwnedCommandAllocator,
     frames: [max_frames_in_flight]GpuFrame,
     frame_storage: ui_frame.Storage = .{},
     text_font: text.Font = .{},
     text_atlas: text.AtlasStorage = .{},
+    text_texture: mtl.resource.OwnedTexture,
+    text_sampler: mtl.resource.OwnedSamplerState,
     argument_table: mtl.resource.OwnedArgumentTable,
     residency_set: mtl.resource.OwnedResidencySet,
     layer_residency_set: ?mtl.layer.LayerResidencySet,
@@ -175,6 +199,9 @@ pub const Surface = struct {
         var pipeline_state = try createSolidQuadPipeline(owned_device.ref(), config.pixel_format);
         errdefer pipeline_state.deinit();
 
+        var text_pipeline_state = try createTextPipeline(owned_device.ref(), config.pixel_format);
+        errdefer text_pipeline_state.deinit();
+
         var command_allocators: [max_frames_in_flight]mtl.command.OwnedCommandAllocator = undefined;
         var allocator_count: usize = 0;
         errdefer {
@@ -186,22 +213,35 @@ pub const Surface = struct {
             command_allocators[allocator_count] = try mtl.command.createAllocator(owned_device.ref());
         }
 
-        var residency_set = try mtl.resource.createResidencySetWithCapacity(owned_device.ref(), max_frames_in_flight);
+        var text_font: text.Font = .{};
+        var text_atlas: text.AtlasStorage = .{};
+        try macos_text.buildAsciiAtlas(&text_font, &text_atlas, "JetBrains Mono", 13.0, 2.0);
+
+        var text_texture = try createTextTexture(owned_device.ref(), &text_atlas);
+        errdefer text_texture.deinit();
+
+        var text_sampler = try mtl.resource.createSamplerState(owned_device.ref(), .{});
+        errdefer text_sampler.deinit();
+
+        var residency_set = try mtl.resource.createResidencySetWithCapacity(owned_device.ref(), residency_allocation_cap);
         errdefer residency_set.deinit();
 
         var frames: [max_frames_in_flight]GpuFrame = undefined;
         var frame_count: usize = 0;
         errdefer {
             for (frames[0..frame_count]) |*frame| {
-                frame.buf.deinit();
+                frame.deinit();
             }
         }
         while (frame_count < frames.len) {
             frames[frame_count] = try createFrame(owned_device.ref());
             const buf = frames[frame_count].buf;
+            const text_buf = frames[frame_count].text_buf;
             frame_count += 1;
             mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(buf.raw));
+            mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(text_buf.raw));
         }
+        mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(text_texture.raw));
         mtl.resource.commit(residency_set.ref());
         mtl.resource.requestResidency(residency_set.ref());
         errdefer mtl.resource.endResidency(residency_set.ref());
@@ -209,17 +249,17 @@ pub const Surface = struct {
         errdefer mtl.command.removeResidencySet(command_queue.ref(), residency_set.ref());
 
         var argument_table = try mtl.resource.createArgumentTableWithConfig(owned_device.ref(), .{
-            .max_buffer_bind_count = 1,
+            .max_buffer_bind_count = 2,
+            .max_texture_bind_count = 1,
+            .max_sampler_state_bind_count = 1,
         });
         errdefer argument_table.deinit();
+        mtl.resource.setTexture(argument_table.ref(), mtl.resource.gpuResourceId(text_texture.ref()), 0);
+        mtl.resource.setSamplerState(argument_table.ref(), mtl.resource.gpuResourceIdSampler(text_sampler.ref()), 0);
 
         var frame_event = try mtl.resource.createSharedEvent(owned_device.ref());
         errdefer frame_event.deinit();
         mtl.resource.setSignaledValue(frame_event.ref(), max_frames_in_flight - 1);
-
-        var text_font: text.Font = .{};
-        var text_atlas: text.AtlasStorage = .{};
-        try macos_text.buildAsciiAtlas(&text_font, &text_atlas, "JetBrains Mono", 13.0, 2.0);
 
         const surface = alloc.create(Surface) catch return Error.OutOfMemory;
         surface.* = .{
@@ -229,11 +269,14 @@ pub const Surface = struct {
             .command_queue = command_queue,
             .command_buffer = command_buffer,
             .pipeline_state = pipeline_state,
+            .text_pipeline_state = text_pipeline_state,
             .command_allocators = command_allocators,
             .frames = frames,
             .frame_storage = .{},
             .text_font = text_font,
             .text_atlas = text_atlas,
+            .text_texture = text_texture,
+            .text_sampler = text_sampler,
             .argument_table = argument_table,
             .residency_set = residency_set,
             .layer_residency_set = layer_residency_set,
@@ -256,9 +299,12 @@ pub const Surface = struct {
         surface.argument_table.deinit();
         surface.residency_set.deinit();
         for (&surface.frames) |*frame| {
-            frame.buf.deinit();
+            frame.deinit();
         }
         surface.frame_event.deinit();
+        surface.text_sampler.deinit();
+        surface.text_texture.deinit();
+        surface.text_pipeline_state.deinit();
         surface.pipeline_state.deinit();
         surface.command_buffer.deinit();
         surface.command_queue.deinit();
@@ -271,7 +317,12 @@ pub const Surface = struct {
         try mtl.layer.resize(surface.layer.ref(), drawable_size, scale);
         const scale32: f32 = @floatCast(scale);
         if (surface.text_font.metrics.scale != scale32) {
-            try macos_text.buildAsciiAtlas(&surface.text_font, &surface.text_atlas, "JetBrains Mono", 13.0, scale32);
+            var next_font: text.Font = .{};
+            var next_atlas: text.AtlasStorage = .{};
+            try macos_text.buildAsciiAtlas(&next_font, &next_atlas, "JetBrains Mono", 13.0, scale32);
+            surface.text_font = next_font;
+            surface.text_atlas = next_atlas;
+            uploadTextAtlas(surface.text_texture.ref(), &surface.text_atlas);
         }
         surface.drawable_size = drawable_size;
         surface.scale = scale;
@@ -324,10 +375,14 @@ pub const Surface = struct {
             .z_near = 0.0,
             .z_far = 1.0,
         });
+        mtl.render.setArgumentTable(
+            encoder,
+            surface.argument_table.ref(),
+            mtl.abi.render_stage_vertex | mtl.abi.render_stage_fragment,
+        );
 
         if (prepared.draw_vertex_count > 0 and prepared.batch_count > 0) {
             mtl.render.setPipelineState(encoder, surface.pipeline_state.ref());
-            mtl.render.setArgumentTable(encoder, surface.argument_table.ref(), mtl.abi.render_stage_vertex);
             for (scene.batches) |batch| {
                 const clip = scene.clips[@intCast(batch.clip_index)];
                 mtl.render.setScissorRect(encoder, .{
@@ -345,6 +400,17 @@ pub const Surface = struct {
             }
         }
 
+        if (prepared.text_vertex_count > 0) {
+            mtl.render.setPipelineState(encoder, surface.text_pipeline_state.ref());
+            mtl.render.setScissorRect(encoder, try drawableScissor(surface.drawable_size));
+            mtl.render.drawPrimitives(
+                encoder,
+                .triangle,
+                0,
+                @intCast(prepared.text_vertex_count),
+            );
+        }
+
         mtl.render.endEncoding(encoder);
         encoder_open = false;
         mtl.command.end(surface.command_buffer.ref());
@@ -358,16 +424,15 @@ pub const Surface = struct {
     }
 
     fn prepareScene(surface: *Surface, scene: *const render.Scene) Error!Draw {
-        var frame_data: render.FrameData = undefined;
-        const compiled = render.compileScene(scene, &frame_data) catch return Error.FrameEncodingFailed;
-        if (compiled.quad_count > frame_quad_cap) return Error.BufferCreationFailed;
-
         const frame_slot = surface.currentFrameSlot();
         const frame = &surface.frames[frame_slot];
-        const frame_bytes: [*]const u8 = @ptrCast(&frame_data);
-        const byte_len = render.frameDataByteLen(compiled.quad_count);
-        @memcpy(frame.bytes[0..byte_len], frame_bytes[0..byte_len]);
+
+        const compiled = render.compileScene(scene, frame.data) catch return Error.FrameEncodingFailed;
+        const text_compiled = render.compileText(scene, frame.text_data) catch return Error.FrameEncodingFailed;
+        if (compiled.quad_count > frame_quad_cap) return Error.BufferCreationFailed;
+
         mtl.resource.setAddress(surface.argument_table.ref(), frame.addr, 0);
+        mtl.resource.setAddress(surface.argument_table.ref(), frame.text_addr, 1);
 
         if (compiled.draw_vertex_count > 0 and compiled.batch_count > 0) {
             for (scene.batches) |batch| {
@@ -375,10 +440,14 @@ pub const Surface = struct {
                 try validateClipRect(clip, surface.drawable_size);
             }
         }
+        if (text_compiled.draw_vertex_count > 0) {
+            _ = try drawableScissor(surface.drawable_size);
+        }
         return .{
             .clear_color = toClearColor(scene.clear_color),
             .draw_vertex_count = compiled.draw_vertex_count,
             .batch_count = compiled.batch_count,
+            .text_vertex_count = text_compiled.draw_vertex_count,
         };
     }
 
@@ -408,6 +477,21 @@ fn createSolidQuadPipeline(
     });
 }
 
+fn createTextPipeline(
+    device: mtl.Device,
+    pixel_format: mtl.abi.PixelFormat,
+) Error!mtl.render.OwnedRenderPipelineState {
+    var library = mtl.render.OwnedLibrary.fromRaw(
+        zpui_platform_create_shader_library(device.raw) orelse return Error.ShaderLibraryCreationFailed,
+    );
+    defer library.deinit();
+
+    return mtl.render.createPipelineStateFromLibrary(device, library.ref(), "zpui_text_vertex", "zpui_text_fragment", .{
+        .pixel_format = pixel_format,
+        .blend = .{ .enabled = true },
+    });
+}
+
 fn createFrame(device: mtl.Device) Error!GpuFrame {
     var buf = try mtl.resource.createBuffer(
         device,
@@ -416,11 +500,53 @@ fn createFrame(device: mtl.Device) Error!GpuFrame {
     );
     errdefer buf.deinit();
 
+    var text_buf = try mtl.resource.createBuffer(
+        device,
+        text_frame_buf_len,
+        mtl.abi.shared_write_combined_buffer_options,
+    );
+    errdefer text_buf.deinit();
+
     return .{
         .buf = buf,
-        .bytes = try mtl.resource.contents(buf.ref()),
+        .data = try bufferContentsAs(buf.ref(), render.FrameData),
         .addr = mtl.resource.gpuAddress(buf.ref()),
+        .text_buf = text_buf,
+        .text_data = try bufferContentsAs(text_buf.ref(), render.TextFrameData),
+        .text_addr = mtl.resource.gpuAddress(text_buf.ref()),
     };
+}
+
+fn bufferContentsAs(buffer: mtl.resource.Buffer, comptime T: type) Error!*T {
+    const bytes = try mtl.resource.contents(buffer);
+    return @ptrCast(@alignCast(bytes));
+}
+
+fn createTextTexture(device: mtl.Device, atlas: *const text.AtlasStorage) Error!mtl.resource.OwnedTexture {
+    var texture = try mtl.resource.createTexture(device, .{
+        .width = text.atlas_width,
+        .height = text.atlas_height,
+        .pixel_format = .r8_unorm,
+        .usage = mtl.abi.texture_usage_shader_read,
+        .storage_mode = .shared,
+    });
+    errdefer texture.deinit();
+
+    uploadTextAtlas(texture.ref(), atlas);
+    return texture;
+}
+
+fn uploadTextAtlas(texture: mtl.resource.Texture, atlas: *const text.AtlasStorage) void {
+    mtl.resource.replaceRegion(
+        texture,
+        .{
+            .origin = .{ .x = 0, .y = 0, .z = 0 },
+            .size = .{ .width = text.atlas_width, .height = text.atlas_height, .depth = 1 },
+        },
+        0,
+        atlas.bytes[0..].ptr,
+        text.atlas_width,
+    );
 }
 
 fn validateClipRect(clip: render.ClipRect, drawable_size: mtl.abi.Size2D) Error!void {
@@ -430,6 +556,15 @@ fn validateClipRect(clip: render.ClipRect, drawable_size: mtl.abi.Size2D) Error!
     const drawable_height = try drawableExtent(drawable_size.height);
     if (clip.x > drawable_width or clip.width > drawable_width - clip.x) return Error.InvalidClipRect;
     if (clip.y > drawable_height or clip.height > drawable_height - clip.y) return Error.InvalidClipRect;
+}
+
+fn drawableScissor(drawable_size: mtl.abi.Size2D) Error!mtl.abi.ScissorRect {
+    return .{
+        .x = 0,
+        .y = 0,
+        .width = try drawableExtent(drawable_size.width),
+        .height = try drawableExtent(drawable_size.height),
+    };
 }
 
 fn drawableExtent(value: f64) Error!u32 {
@@ -491,6 +626,9 @@ test "surface status values stay stable across the Objective-C ABI" {
     try std.testing.expectEqual(Status.invalid_surface, Status.fromError(Error.InvalidSurface));
     try std.testing.expectEqual(Status.unsupported_device, Status.fromError(Error.UnsupportedDevice));
     try std.testing.expectEqual(Status.pipeline_creation_failed, Status.fromError(Error.PipelineCreationFailed));
+    try std.testing.expectEqual(Status.texture_creation_failed, Status.fromError(Error.TextureCreationFailed));
+    try std.testing.expectEqual(Status.sampler_state_creation_failed, Status.fromError(Error.SamplerStateCreationFailed));
+    try std.testing.expectEqual(Status.invalid_texture_size, Status.fromError(Error.InvalidTextureSize));
     try std.testing.expectEqual(Status.frame_encoding_failed, Status.fromError(Error.FrameEncodingFailed));
     try std.testing.expectEqual(Status.frame_wait_timed_out, Status.fromError(Error.FrameWaitTimedOut));
     try std.testing.expectEqual(Status.invalid_clip_rect, Status.fromError(Error.InvalidClipRect));
@@ -509,4 +647,6 @@ test "surface clip validation rejects scissors outside the drawable" {
 test "surface frame buffer capacity matches the scene contract" {
     try std.testing.expectEqual(@as(usize, render.max_quads), frame_quad_cap);
     try std.testing.expectEqual(@sizeOf(render.FrameData), frame_buf_len);
+    try std.testing.expectEqual(@sizeOf(render.TextFrameData), text_frame_buf_len);
+    try std.testing.expectEqual(@as(usize, max_frames_in_flight * 2 + 1), residency_allocation_cap);
 }

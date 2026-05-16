@@ -131,6 +131,16 @@ static const char *zpui_platform_status_name(int status) {
         return "too many items";
     case 49:
         return "font atlas creation failed";
+    case 50:
+        return "texture descriptor creation failed";
+    case 51:
+        return "texture creation failed";
+    case 52:
+        return "invalid texture size";
+    case 53:
+        return "sampler descriptor creation failed";
+    case 54:
+        return "sampler state creation failed";
     default:
         return "unknown platform error";
     }
