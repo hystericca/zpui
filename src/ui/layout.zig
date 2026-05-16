@@ -180,6 +180,7 @@ pub const LayoutError = error{
     InvalidGap,
     InvalidConstraints,
     InvalidSize,
+    NumericOverflow,
 };
 
 pub fn pack(spec: Pack, items: []const LayoutItem, out: []LayoutResult) LayoutError!LayoutSummary {
@@ -214,17 +215,17 @@ pub fn pack(spec: Pack, items: []const LayoutItem, out: []LayoutResult) LayoutEr
             size = size.withAlong(cross_axis, stretched);
         }
 
-        if (visible_count != 0) cursor += spec.gap;
+        if (visible_count != 0) cursor = try addScalar(cursor, spec.gap);
 
-        const rect = rectFor(spec.bounds, axis, spec.cross_align, cursor, size);
+        const rect = try rectFor(spec.bounds, axis, spec.cross_align, cursor, size);
         out[index] = .{
             .rect = rect,
-            .clip = rect.intersect(clip),
+            .clip = try intersectRect(rect, clip),
         };
 
-        cursor += size.along(axis);
-        content_main += size.along(axis);
-        if (visible_count != 0) content_main += spec.gap;
+        cursor = try addScalar(cursor, size.along(axis));
+        content_main = try addScalar(content_main, size.along(axis));
+        if (visible_count != 0) content_main = try addScalar(content_main, spec.gap);
         content_cross = @max(content_cross, size.along(cross_axis));
         visible_count += 1;
     }
@@ -246,37 +247,44 @@ pub fn splitEdge(spec: Split) LayoutError!SplitResult {
     if (!validNonNegative(spec.size)) return LayoutError.InvalidSize;
     if (!validNonNegative(spec.gap)) return LayoutError.InvalidGap;
 
-    const total = spec.size + spec.gap;
+    const along = switch (spec.edge) {
+        .left, .right => spec.bounds.width,
+        .top, .bottom => spec.bounds.height,
+    };
+    const head_size = @min(spec.size, along);
+    const consumed = consumedWithin(along, head_size, spec.gap);
+    const tail_size = along - consumed;
+
     return switch (spec.edge) {
         .left => .{
-            .head = Rect.init(spec.bounds.x, spec.bounds.y, spec.size, spec.bounds.height),
-            .tail = Rect.init(spec.bounds.x + total, spec.bounds.y, @max(spec.bounds.width - total, 0.0), spec.bounds.height),
+            .head = Rect.init(spec.bounds.x, spec.bounds.y, head_size, spec.bounds.height),
+            .tail = Rect.init(try addScalar(spec.bounds.x, consumed), spec.bounds.y, tail_size, spec.bounds.height),
         },
         .top => .{
-            .head = Rect.init(spec.bounds.x, spec.bounds.y, spec.bounds.width, spec.size),
-            .tail = Rect.init(spec.bounds.x, spec.bounds.y + total, spec.bounds.width, @max(spec.bounds.height - total, 0.0)),
+            .head = Rect.init(spec.bounds.x, spec.bounds.y, spec.bounds.width, head_size),
+            .tail = Rect.init(spec.bounds.x, try addScalar(spec.bounds.y, consumed), spec.bounds.width, tail_size),
         },
         .right => .{
-            .head = Rect.init(spec.bounds.x + spec.bounds.width - spec.size, spec.bounds.y, spec.size, spec.bounds.height),
-            .tail = Rect.init(spec.bounds.x, spec.bounds.y, @max(spec.bounds.width - total, 0.0), spec.bounds.height),
+            .head = Rect.init(try addScalar(spec.bounds.x, along - head_size), spec.bounds.y, head_size, spec.bounds.height),
+            .tail = Rect.init(spec.bounds.x, spec.bounds.y, tail_size, spec.bounds.height),
         },
         .bottom => .{
-            .head = Rect.init(spec.bounds.x, spec.bounds.y + spec.bounds.height - spec.size, spec.bounds.width, spec.size),
-            .tail = Rect.init(spec.bounds.x, spec.bounds.y, spec.bounds.width, @max(spec.bounds.height - total, 0.0)),
+            .head = Rect.init(spec.bounds.x, try addScalar(spec.bounds.y, along - head_size), spec.bounds.width, head_size),
+            .tail = Rect.init(spec.bounds.x, spec.bounds.y, spec.bounds.width, tail_size),
         },
     };
 }
 
-fn rectFor(bounds: Rect, axis: Axis, alignment: Align, cursor: f32, size: Size) Rect {
+fn rectFor(bounds: Rect, axis: Axis, alignment: Align, cursor: f32, size: Size) LayoutError!Rect {
     return switch (axis) {
         .horizontal => .{
             .x = cursor,
-            .y = crossOrigin(bounds.y, bounds.height, size.height, alignment),
+            .y = try crossOrigin(bounds.y, bounds.height, size.height, alignment),
             .width = size.width,
             .height = size.height,
         },
         .vertical => .{
-            .x = crossOrigin(bounds.x, bounds.width, size.width, alignment),
+            .x = try crossOrigin(bounds.x, bounds.width, size.width, alignment),
             .y = cursor,
             .width = size.width,
             .height = size.height,
@@ -291,12 +299,43 @@ fn alongOrigin(bounds: Rect, axis: Axis) f32 {
     };
 }
 
-fn crossOrigin(origin: f32, available: f32, size: f32, alignment: Align) f32 {
+fn crossOrigin(origin: f32, available: f32, size: f32, alignment: Align) LayoutError!f32 {
     return switch (alignment) {
         .start, .stretch => origin,
-        .center => origin + (available - size) * 0.5,
-        .end => origin + available - size,
+        .center => addScalar(origin, (available - size) * 0.5),
+        .end => addScalar(origin, available - size),
     };
+}
+
+fn intersectRect(a: Rect, b: Rect) LayoutError!Rect {
+    const x0 = @max(a.x, b.x);
+    const y0 = @max(a.y, b.y);
+    const x1 = @min(try addScalar(a.x, a.width), try addScalar(b.x, b.width));
+    const y1 = @min(try addScalar(a.y, a.height), try addScalar(b.y, b.height));
+    return .{
+        .x = x0,
+        .y = y0,
+        .width = @max(try subScalar(x1, x0), 0.0),
+        .height = @max(try subScalar(y1, y0), 0.0),
+    };
+}
+
+fn consumedWithin(available: f32, head_size: f32, gap: f32) f32 {
+    const remaining = available - head_size;
+    if (gap >= remaining) return available;
+    return head_size + gap;
+}
+
+fn addScalar(a: f32, b: f32) LayoutError!f32 {
+    const result = a + b;
+    if (!validScalar(result)) return LayoutError.NumericOverflow;
+    return result;
+}
+
+fn subScalar(a: f32, b: f32) LayoutError!f32 {
+    const result = a - b;
+    if (!validScalar(result)) return LayoutError.NumericOverflow;
+    return result;
 }
 
 fn overflow(content_size: Size, bounds_size: Size) Size {
@@ -473,7 +512,7 @@ test "split edge carves explicit rio-style bands" {
     try std.testing.expectEqual(Rect.init(0.0, 0.0, 100.0, 20.0), bottom.tail);
 }
 
-test "split edge preserves head size and empties tail on overflow" {
+test "split edge clamps head to bounds and empties tail on overflow" {
     const result = try splitEdge(.{
         .bounds = Rect.init(0.0, 0.0, 20.0, 10.0),
         .edge = .right,
@@ -481,8 +520,26 @@ test "split edge preserves head size and empties tail on overflow" {
         .gap = 4.0,
     });
 
-    try std.testing.expectEqual(Rect.init(-10.0, 0.0, 30.0, 10.0), result.head);
+    try std.testing.expectEqual(Rect.init(0.0, 0.0, 20.0, 10.0), result.head);
     try std.testing.expectEqual(Rect.init(0.0, 0.0, 0.0, 10.0), result.tail);
+}
+
+test "layout rejects finite inputs that overflow during arithmetic" {
+    const items = [_]LayoutItem{
+        LayoutItem.fixed(Size.init(max_f32, 1.0)),
+        LayoutItem.fixed(Size.init(max_f32, 1.0)),
+    };
+    var out: [items.len]LayoutResult = undefined;
+
+    try std.testing.expectError(LayoutError.NumericOverflow, pack(.{
+        .bounds = Rect.init(0.0, 0.0, max_f32, 1.0),
+    }, items[0..], out[0..]));
+
+    try std.testing.expectError(LayoutError.NumericOverflow, splitEdge(.{
+        .bounds = Rect.init(max_f32, 0.0, max_f32, 10.0),
+        .edge = .right,
+        .size = 1.0,
+    }));
 }
 
 test "layout validates caller buffers and numeric inputs" {
