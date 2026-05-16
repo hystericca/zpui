@@ -1,6 +1,9 @@
 const std = @import("std");
 
 const mtl = @import("zmtl4");
+const macos_text = @import("platform/macos_text.zig");
+const text = @import("text.zig");
+const ui_frame = @import("frame.zig");
 const render = @import("render.zig");
 
 pub const ObjCId = mtl.runtime.Id;
@@ -15,7 +18,7 @@ pub const Error = mtl.Error || error{
     FrameWaitTimedOut,
     InvalidClipRect,
     OutOfMemory,
-};
+} || macos_text.Error;
 
 pub const max_frames_in_flight = 3;
 pub const frame_quad_cap = render.max_quads;
@@ -25,7 +28,7 @@ const frame_drain_timeout_ms = 5_000;
 
 extern fn zpui_platform_create_shader_library(device: ObjCId) ObjCId;
 
-const Frame = struct {
+const GpuFrame = struct {
     buf: mtl.resource.OwnedBuffer,
     bytes: [*]u8,
     addr: mtl.abi.GPUAddress,
@@ -78,6 +81,7 @@ pub const Status = enum(c_int) {
     invalid_drawable_count = 46,
     drawable_unavailable = 47,
     too_many_items = 48,
+    font_atlas_creation_failed = 49,
 
     pub fn fromError(err: Error) Status {
         return switch (err) {
@@ -118,6 +122,7 @@ pub const Status = enum(c_int) {
             Error.FrameWaitTimedOut => .frame_wait_timed_out,
             Error.InvalidClipRect => .invalid_clip_rect,
             Error.OutOfMemory => .out_of_memory,
+            Error.FontAtlasCreationFailed => .font_atlas_creation_failed,
         };
     }
 };
@@ -130,7 +135,10 @@ pub const Surface = struct {
     command_buffer: mtl.command.OwnedCommandBuffer,
     pipeline_state: mtl.render.OwnedRenderPipelineState,
     command_allocators: [max_frames_in_flight]mtl.command.OwnedCommandAllocator,
-    frames: [max_frames_in_flight]Frame,
+    frames: [max_frames_in_flight]GpuFrame,
+    frame_storage: ui_frame.Storage = .{},
+    text_font: text.Font = .{},
+    text_atlas: text.AtlasStorage = .{},
     argument_table: mtl.resource.OwnedArgumentTable,
     residency_set: mtl.resource.OwnedResidencySet,
     layer_residency_set: ?mtl.layer.LayerResidencySet,
@@ -181,7 +189,7 @@ pub const Surface = struct {
         var residency_set = try mtl.resource.createResidencySetWithCapacity(owned_device.ref(), max_frames_in_flight);
         errdefer residency_set.deinit();
 
-        var frames: [max_frames_in_flight]Frame = undefined;
+        var frames: [max_frames_in_flight]GpuFrame = undefined;
         var frame_count: usize = 0;
         errdefer {
             for (frames[0..frame_count]) |*frame| {
@@ -209,6 +217,10 @@ pub const Surface = struct {
         errdefer frame_event.deinit();
         mtl.resource.setSignaledValue(frame_event.ref(), max_frames_in_flight - 1);
 
+        var text_font: text.Font = .{};
+        var text_atlas: text.AtlasStorage = .{};
+        try macos_text.buildAsciiAtlas(&text_font, &text_atlas, "JetBrains Mono", 13.0, 2.0);
+
         const surface = alloc.create(Surface) catch return Error.OutOfMemory;
         surface.* = .{
             .allocator = alloc,
@@ -219,6 +231,9 @@ pub const Surface = struct {
             .pipeline_state = pipeline_state,
             .command_allocators = command_allocators,
             .frames = frames,
+            .frame_storage = .{},
+            .text_font = text_font,
+            .text_atlas = text_atlas,
             .argument_table = argument_table,
             .residency_set = residency_set,
             .layer_residency_set = layer_residency_set,
@@ -254,6 +269,10 @@ pub const Surface = struct {
 
     pub fn resize(surface: *Surface, drawable_size: mtl.abi.Size2D, scale: mtl.abi.CGFloat) Error!void {
         try mtl.layer.resize(surface.layer.ref(), drawable_size, scale);
+        const scale32: f32 = @floatCast(scale);
+        if (surface.text_font.metrics.scale != scale32) {
+            try macos_text.buildAsciiAtlas(&surface.text_font, &surface.text_atlas, "JetBrains Mono", 13.0, scale32);
+        }
         surface.drawable_size = drawable_size;
         surface.scale = scale;
         surface.resize_generation +%= 1;
@@ -389,7 +408,7 @@ fn createSolidQuadPipeline(
     });
 }
 
-fn createFrame(device: mtl.Device) Error!Frame {
+fn createFrame(device: mtl.Device) Error!GpuFrame {
     var buf = try mtl.resource.createBuffer(
         device,
         frame_buf_len,

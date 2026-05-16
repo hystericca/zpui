@@ -1,6 +1,8 @@
 #import <Cocoa/Cocoa.h>
+#import <CoreText/CoreText.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <math.h>
 #import <mach-o/dyld.h>
 #import <stdatomic.h>
 #import <stdint.h>
@@ -9,6 +11,35 @@
 #import <string.h>
 
 typedef struct ZPUISurface ZPUISurface;
+
+typedef struct {
+    float size;
+    float scale;
+    float ascent;
+    float descent;
+    float leading;
+    float line_height;
+    uint32_t atlas_width;
+    uint32_t atlas_height;
+} ZPUITextFontMetrics;
+
+typedef struct {
+    uint32_t codepoint;
+    uint32_t glyph_id;
+    uint32_t atlas_x;
+    uint32_t atlas_y;
+    uint32_t atlas_width;
+    uint32_t atlas_height;
+    float offset_x;
+    float offset_y;
+    float advance;
+    uint32_t flags;
+} ZPUITextGlyphMetric;
+
+enum {
+    ZPUI_TEXT_GLYPH_PRESENT = 1u << 0,
+    ZPUI_TEXT_GLYPH_VISIBLE = 1u << 1,
+};
 
 extern int zpui_surface_create(id device, ZPUISurface **outSurface);
 extern void zpui_surface_destroy(ZPUISurface *surface);
@@ -98,6 +129,8 @@ static const char *zpui_platform_status_name(int status) {
         return "drawable unavailable";
     case 48:
         return "too many items";
+    case 49:
+        return "font atlas creation failed";
     default:
         return "unknown platform error";
     }
@@ -127,6 +160,153 @@ static NSURL *zpui_metallib_url(void) {
     NSString *executableDirectory = [executablePath stringByDeletingLastPathComponent];
     NSString *metallibPath = [executableDirectory stringByAppendingPathComponent:@"zpui.metallib"];
     return [NSURL fileURLWithPath:metallibPath];
+}
+
+int zpui_macos_build_ascii_font_atlas(const char *fontName,
+                                      float fontSize,
+                                      float scale,
+                                      uint8_t *atlasBytes,
+                                      uint32_t atlasWidth,
+                                      uint32_t atlasHeight,
+                                      ZPUITextFontMetrics *outMetrics,
+                                      ZPUITextGlyphMetric *outGlyphs,
+                                      uint32_t glyphCount) {
+    if (fontName == NULL || atlasBytes == NULL || outMetrics == NULL || outGlyphs == NULL) {
+        return 1;
+    }
+    if (fontSize <= 0.0f || scale <= 0.0f || atlasWidth == 0 || atlasHeight == 0 ||
+        glyphCount < 128) {
+        return 1;
+    }
+
+    memset(atlasBytes, 0, (size_t)atlasWidth * (size_t)atlasHeight);
+    memset(outGlyphs, 0, sizeof(ZPUITextGlyphMetric) * glyphCount);
+
+    CGFloat pixelSize = (CGFloat)fontSize * (CGFloat)scale;
+    CFStringRef requestedName = CFStringCreateWithCString(NULL, fontName, kCFStringEncodingUTF8);
+    if (requestedName == NULL) {
+        return 1;
+    }
+
+    CTFontRef font = CTFontCreateWithName(requestedName, pixelSize, NULL);
+    CFRelease(requestedName);
+    if (font == NULL) {
+        font = CTFontCreateWithName(CFSTR("Menlo"), pixelSize, NULL);
+    }
+    if (font == NULL) {
+        return 1;
+    }
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceGray();
+    if (colorSpace == NULL) {
+        CFRelease(font);
+        return 1;
+    }
+
+    CGContextRef context = CGBitmapContextCreate(atlasBytes,
+                                                 atlasWidth,
+                                                 atlasHeight,
+                                                 8,
+                                                 atlasWidth,
+                                                 colorSpace,
+                                                 kCGImageAlphaOnly);
+    CGColorSpaceRelease(colorSpace);
+    if (context == NULL) {
+        CFRelease(font);
+        return 1;
+    }
+
+    CGContextSetTextDrawingMode(context, kCGTextFill);
+    CGContextSetAllowsAntialiasing(context, true);
+    CGContextSetShouldAntialias(context, true);
+    CGContextSetAllowsFontSubpixelPositioning(context, true);
+    CGContextSetShouldSubpixelPositionFonts(context, true);
+    CGContextSetAllowsFontSubpixelQuantization(context, false);
+    CGContextSetShouldSubpixelQuantizeFonts(context, false);
+    CGContextSetShouldSmoothFonts(context, false);
+    CGContextSetGrayFillColor(context, 1.0, 1.0);
+
+    outMetrics->size = (float)pixelSize;
+    outMetrics->scale = scale;
+    outMetrics->ascent = (float)CTFontGetAscent(font);
+    outMetrics->descent = (float)CTFontGetDescent(font);
+    outMetrics->leading = (float)CTFontGetLeading(font);
+    outMetrics->line_height = outMetrics->ascent + outMetrics->descent + outMetrics->leading;
+    outMetrics->atlas_width = atlasWidth;
+    outMetrics->atlas_height = atlasHeight;
+
+    const uint32_t pad = 2;
+    uint32_t penX = pad;
+    uint32_t penY = pad;
+    uint32_t rowHeight = 0;
+
+    for (uint32_t codepoint = 32; codepoint <= 126; codepoint++) {
+        UniChar character = (UniChar)codepoint;
+        CGGlyph glyph = 0;
+        bool found = CTFontGetGlyphsForCharacters(font, &character, &glyph, 1);
+        if (!found) {
+            continue;
+        }
+
+        CGSize advance = CGSizeZero;
+        CTFontGetAdvancesForGlyphs(font, kCTFontOrientationHorizontal, &glyph, &advance, 1);
+        CGRect bounds =
+            CTFontGetBoundingRectsForGlyphs(font, kCTFontOrientationHorizontal, &glyph, NULL, 1);
+
+        ZPUITextGlyphMetric *metric = &outGlyphs[codepoint];
+        metric->codepoint = codepoint;
+        metric->glyph_id = glyph;
+        metric->advance = (float)advance.width;
+        metric->flags = ZPUI_TEXT_GLYPH_PRESENT;
+
+        if (CGRectIsEmpty(bounds) || bounds.size.width <= 0.0 || bounds.size.height <= 0.0) {
+            continue;
+        }
+
+        const uint32_t glyphWidth = (uint32_t)ceil(bounds.size.width);
+        const uint32_t glyphHeight = (uint32_t)ceil(bounds.size.height);
+        const uint32_t tileWidth = glyphWidth + pad * 2;
+        const uint32_t tileHeight = glyphHeight + pad * 2;
+        if (tileWidth >= atlasWidth || tileHeight >= atlasHeight) {
+            CGContextRelease(context);
+            CFRelease(font);
+            return 1;
+        }
+
+        if (penX + tileWidth >= atlasWidth) {
+            penX = pad;
+            penY += rowHeight + pad;
+            rowHeight = 0;
+        }
+        if (penY + tileHeight >= atlasHeight) {
+            CGContextRelease(context);
+            CFRelease(font);
+            return 1;
+        }
+
+        metric->atlas_x = penX;
+        metric->atlas_y = penY;
+        metric->atlas_width = tileWidth;
+        metric->atlas_height = tileHeight;
+        metric->offset_x = (float)floor(bounds.origin.x) - (float)pad;
+        metric->offset_y =
+            outMetrics->ascent - (float)ceil(bounds.origin.y + bounds.size.height) - (float)pad;
+        metric->flags |= ZPUI_TEXT_GLYPH_VISIBLE;
+
+        CGPoint point =
+            CGPointMake((CGFloat)penX + (CGFloat)pad - bounds.origin.x,
+                        (CGFloat)atlasHeight - ((CGFloat)penY + (CGFloat)pad - bounds.origin.y));
+        CTFontDrawGlyphs(font, &glyph, &point, 1, context);
+
+        penX += tileWidth + pad;
+        if (tileHeight > rowHeight) {
+            rowHeight = tileHeight;
+        }
+    }
+
+    CGContextRelease(context);
+    CFRelease(font);
+    return 0;
 }
 
 id<MTLLibrary> zpui_platform_create_shader_library(id<MTLDevice> device)

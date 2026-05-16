@@ -54,6 +54,8 @@ fn linkMacOSPlatform(b: *std.Build, module: *std.Build.Module, target: std.Build
         .language = .objective_c,
     });
     module.linkFramework("Cocoa", .{});
+    module.linkFramework("CoreGraphics", .{});
+    module.linkFramework("CoreText", .{});
     module.linkFramework("Metal", .{});
     module.linkFramework("QuartzCore", .{});
     module.linkSystemLibrary("objc", .{});

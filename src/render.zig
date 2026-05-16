@@ -1,4 +1,5 @@
 const std = @import("std");
+const text = @import("text.zig");
 
 pub const max_quads = 128;
 pub const max_batches = 32;
@@ -47,6 +48,8 @@ pub const Scene = struct {
     quads: []const Quad,
     batches: []const Batch,
     clips: []const ClipRect,
+    glyphs: []const text.GlyphInstance,
+    font: ?*const text.Font,
 };
 
 pub const SceneStorage = struct {
@@ -185,6 +188,8 @@ pub const SceneBuilder = struct {
             .quads = builder.storage.quads[0..quad_count],
             .batches = builder.storage.batches[0..batch_count],
             .clips = builder.storage.clips[0..clip_count],
+            .glyphs = &.{},
+            .font = null,
         };
     }
 };
@@ -380,6 +385,8 @@ test "scene compiler rejects malformed scenes" {
         .quads = quads[0..],
         .batches = batches[0..],
         .clips = clips[0..],
+        .glyphs = &.{},
+        .font = null,
     };
 
     var frame_data: FrameData = undefined;
