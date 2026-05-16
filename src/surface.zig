@@ -49,6 +49,7 @@ const Draw = struct {
     draw_vertex_count: u32,
     batch_count: u32,
     text_vertex_count: u32,
+    text_batch_count: u32,
 };
 
 pub const Status = enum(c_int) {
@@ -400,15 +401,23 @@ pub const Surface = struct {
             }
         }
 
-        if (prepared.text_vertex_count > 0) {
+        if (prepared.text_vertex_count > 0 and prepared.text_batch_count > 0) {
             mtl.render.setPipelineState(encoder, surface.text_pipeline_state.ref());
-            mtl.render.setScissorRect(encoder, try drawableScissor(surface.drawable_size));
-            mtl.render.drawPrimitives(
-                encoder,
-                .triangle,
-                0,
-                @intCast(prepared.text_vertex_count),
-            );
+            for (scene.text_batches) |batch| {
+                const clip = scene.clips[@intCast(batch.clip_index)];
+                mtl.render.setScissorRect(encoder, .{
+                    .x = clip.x,
+                    .y = clip.y,
+                    .width = clip.width,
+                    .height = clip.height,
+                });
+                mtl.render.drawPrimitives(
+                    encoder,
+                    .triangle,
+                    @intCast(batch.vertex_start),
+                    @intCast(batch.vertex_count),
+                );
+            }
         }
 
         mtl.render.endEncoding(encoder);
@@ -441,13 +450,17 @@ pub const Surface = struct {
             }
         }
         if (text_compiled.draw_vertex_count > 0) {
-            _ = try drawableScissor(surface.drawable_size);
+            for (scene.text_batches) |batch| {
+                const clip = scene.clips[@intCast(batch.clip_index)];
+                try validateClipRect(clip, surface.drawable_size);
+            }
         }
         return .{
             .clear_color = toClearColor(scene.clear_color),
             .draw_vertex_count = compiled.draw_vertex_count,
             .batch_count = compiled.batch_count,
             .text_vertex_count = text_compiled.draw_vertex_count,
+            .text_batch_count = text_compiled.batch_count,
         };
     }
 
@@ -556,15 +569,6 @@ fn validateClipRect(clip: render.ClipRect, drawable_size: mtl.abi.Size2D) Error!
     const drawable_height = try drawableExtent(drawable_size.height);
     if (clip.x > drawable_width or clip.width > drawable_width - clip.x) return Error.InvalidClipRect;
     if (clip.y > drawable_height or clip.height > drawable_height - clip.y) return Error.InvalidClipRect;
-}
-
-fn drawableScissor(drawable_size: mtl.abi.Size2D) Error!mtl.abi.ScissorRect {
-    return .{
-        .x = 0,
-        .y = 0,
-        .width = try drawableExtent(drawable_size.width),
-        .height = try drawableExtent(drawable_size.height),
-    };
 }
 
 fn drawableExtent(value: f64) Error!u32 {

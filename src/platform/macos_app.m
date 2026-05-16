@@ -45,7 +45,7 @@ extern int zpui_surface_create(id device, ZPUISurface **outSurface);
 extern void zpui_surface_destroy(ZPUISurface *surface);
 extern CAMetalLayer *zpui_surface_layer(ZPUISurface *surface);
 extern int zpui_surface_resize(ZPUISurface *surface, double width, double height, double scale);
-extern int zpui_demo_draw_frame(ZPUISurface *surface, id<CAMetalDrawable> drawable);
+extern int zpui_macos_draw_frame(ZPUISurface *surface, id<CAMetalDrawable> drawable);
 
 static const char *zpui_platform_status_name(int status) {
     switch (status) {
@@ -461,7 +461,7 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
         return NO;
     }
 
-    int drawStatus = zpui_demo_draw_frame(_surface, drawable);
+    int drawStatus = zpui_macos_draw_frame(_surface, drawable);
     if (drawStatus != 0) {
         fprintf(stderr, "ZPUI: failed to draw frame in Zig: %s (%d)\n",
                 zpui_platform_status_name(drawStatus), drawStatus);
@@ -652,8 +652,17 @@ static void zpui_install_menu(void) {
     [appMenuItem setSubmenu:appMenu];
 }
 
-int zpui_run_macos_hello_window(void) {
+int zpui_macos_init_window(const char *title, double width, double height) {
     @autoreleasepool {
+        if (title == NULL || title[0] == '\0' || width <= 0.0 || height <= 0.0) {
+            return 1;
+        }
+
+        NSString *windowTitle = [[NSString alloc] initWithUTF8String:title];
+        if (windowTitle == nil) {
+            return 1;
+        }
+
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         zpuiAppDelegate = [[ZPUIAppDelegate alloc] init];
@@ -666,7 +675,7 @@ int zpui_run_macos_hello_window(void) {
             return 2;
         }
 
-        const NSRect frame = NSMakeRect(0, 0, 960, 600);
+        const NSRect frame = NSMakeRect(0, 0, width, height);
         const NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                                         NSWindowStyleMaskMiniaturizable |
                                         NSWindowStyleMaskResizable;
@@ -679,7 +688,7 @@ int zpui_run_macos_hello_window(void) {
             return 1;
         }
 
-        window.title = @"ZPUI";
+        window.title = windowTitle;
         window.releasedWhenClosed = NO;
         [window center];
 

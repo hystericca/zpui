@@ -3,6 +3,7 @@ const text = @import("text.zig");
 
 pub const max_quads = 128;
 pub const max_batches = 32;
+pub const max_text_batches = 128;
 pub const max_clips = 32;
 pub const vertices_per_quad = 6;
 pub const vertices_per_glyph = 6;
@@ -44,6 +45,13 @@ pub const Batch = extern struct {
     reserved: u32 = 0,
 };
 
+pub const TextBatch = extern struct {
+    vertex_start: u32,
+    vertex_count: u32,
+    clip_index: u32,
+    reserved: u32 = 0,
+};
+
 pub const Scene = struct {
     clear_color: ClearColor,
     drawable_size: [2]f32,
@@ -51,6 +59,7 @@ pub const Scene = struct {
     batches: []const Batch,
     clips: []const ClipRect,
     glyphs: []const text.GlyphInstance,
+    text_batches: []const TextBatch,
     font: ?*const text.Font,
 };
 
@@ -79,6 +88,7 @@ comptime {
     std.debug.assert(@sizeOf(ClipRect) == 16);
     std.debug.assert(@sizeOf(GpuQuad) == 32);
     std.debug.assert(@sizeOf(Batch) == 16);
+    std.debug.assert(@sizeOf(TextBatch) == 16);
     std.debug.assert(@sizeOf(FrameData) == frameDataByteLen(max_quads));
     std.debug.assert(@sizeOf(TextFrameData) == textFrameDataByteLen(text.max_frame_glyphs));
     std.debug.assert(@offsetOf(FrameData, "drawable_size") == 0);
@@ -109,6 +119,8 @@ pub const CompileError = error{
     BatchCapacityExceeded,
     ClipCapacityExceeded,
     GlyphCapacityExceeded,
+    TextBatchCapacityExceeded,
+    InvalidTextBatch,
     BatchClipMismatch,
 };
 
@@ -121,6 +133,7 @@ pub const CompileResult = struct {
 pub const TextCompileResult = struct {
     draw_vertex_count: u32,
     glyph_count: u32,
+    batch_count: u32,
 };
 
 pub const SceneBuilder = struct {
@@ -208,6 +221,7 @@ pub const SceneBuilder = struct {
             .batches = builder.storage.batches[0..batch_count],
             .clips = builder.storage.clips[0..clip_count],
             .glyphs = &.{},
+            .text_batches = &.{},
             .font = null,
         };
     }
@@ -262,6 +276,7 @@ pub fn compileScene(scene: *const Scene, frame_data: *FrameData) CompileError!Co
 
 pub fn compileText(scene: *const Scene, frame_data: *TextFrameData) CompileError!TextCompileResult {
     if (scene.glyphs.len > text.max_frame_glyphs) return CompileError.GlyphCapacityExceeded;
+    if (scene.text_batches.len > max_text_batches) return CompileError.TextBatchCapacityExceeded;
 
     frame_data.drawable_size = scene.drawable_size;
     frame_data.glyph_count = @intCast(scene.glyphs.len);
@@ -270,9 +285,25 @@ pub fn compileText(scene: *const Scene, frame_data: *TextFrameData) CompileError
         frame_data.glyphs[i] = glyph;
     }
 
+    const max_vertex_count: u32 = @intCast(scene.glyphs.len * vertices_per_glyph);
+    var draw_vertex_count: u32 = 0;
+    var next_vertex_start: u32 = 0;
+    for (scene.text_batches) |batch| {
+        const clip_index: usize = @intCast(batch.clip_index);
+        if (clip_index >= scene.clips.len) return CompileError.InvalidClipIndex;
+        if (batch.vertex_count == 0 or batch.vertex_count % vertices_per_glyph != 0) return CompileError.InvalidTextBatch;
+        if (batch.vertex_start % vertices_per_glyph != 0) return CompileError.InvalidTextBatch;
+        if (batch.vertex_start != next_vertex_start) return CompileError.InvalidTextBatch;
+        if (batch.vertex_start > max_vertex_count or batch.vertex_count > max_vertex_count - batch.vertex_start) return CompileError.InvalidTextBatch;
+        draw_vertex_count += batch.vertex_count;
+        next_vertex_start += batch.vertex_count;
+    }
+    if (next_vertex_start != max_vertex_count) return CompileError.InvalidTextBatch;
+
     return .{
-        .draw_vertex_count = @intCast(scene.glyphs.len * vertices_per_glyph),
+        .draw_vertex_count = draw_vertex_count,
         .glyph_count = @intCast(scene.glyphs.len),
+        .batch_count = @intCast(scene.text_batches.len),
     };
 }
 
@@ -305,6 +336,7 @@ test "scene and GPU frame layouts stay stable" {
     try std.testing.expectEqual(@as(usize, 36), @sizeOf(Quad));
     try std.testing.expectEqual(@as(usize, 32), @sizeOf(GpuQuad));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(Batch));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(TextBatch));
     try std.testing.expectEqual(frameDataByteLen(max_quads), @sizeOf(FrameData));
     try std.testing.expectEqual(textFrameDataByteLen(text.max_frame_glyphs), @sizeOf(TextFrameData));
 
@@ -380,8 +412,13 @@ test "text compiler emits compact glyph frame data" {
         .drawable_size = .{ 640.0, 480.0 },
         .quads = &.{},
         .batches = &.{},
-        .clips = &.{},
+        .clips = &.{.{ .x = 0, .y = 0, .width = 640, .height = 480 }},
         .glyphs = glyphs[0..],
+        .text_batches = &.{.{
+            .vertex_start = 0,
+            .vertex_count = vertices_per_glyph,
+            .clip_index = 0,
+        }},
         .font = null,
     };
 
@@ -390,15 +427,45 @@ test "text compiler emits compact glyph frame data" {
 
     try std.testing.expectEqual(@as(u32, vertices_per_glyph), result.draw_vertex_count);
     try std.testing.expectEqual(@as(u32, 1), result.glyph_count);
+    try std.testing.expectEqual(@as(u32, 1), result.batch_count);
     try std.testing.expectEqual([2]f32{ 640.0, 480.0 }, frame_data.drawable_size);
     try std.testing.expectEqual(@as(u32, 1), frame_data.glyph_count);
     try std.testing.expectEqual(glyphs[0], frame_data.glyphs[0]);
     try std.testing.expectEqual(@as(usize, 64), textFrameDataByteLen(result.glyph_count));
 
     scene.glyphs = &.{};
+    scene.text_batches = &.{};
     const empty = try compileText(&scene, &frame_data);
     try std.testing.expectEqual(@as(u32, 0), empty.draw_vertex_count);
     try std.testing.expectEqual(@as(u32, 0), empty.glyph_count);
+    try std.testing.expectEqual(@as(u32, 0), empty.batch_count);
+}
+
+test "text compiler rejects malformed text batches" {
+    var glyphs = [_]text.GlyphInstance{.{
+        .rect = .{ .x = 0.0, .y = 0.0, .width = 1.0, .height = 1.0 },
+        .atlas_rect = .{ .x = 0.0, .y = 0.0, .width = 1.0, .height = 1.0 },
+        .color = .{ .r = 1.0, .g = 1.0, .b = 1.0, .a = 1.0 },
+    }};
+    var clips = [_]ClipRect{.{ .x = 0, .y = 0, .width = 640, .height = 480 }};
+    var batches = [_]TextBatch{.{ .vertex_start = 0, .vertex_count = 0, .clip_index = 0 }};
+    var scene: Scene = .{
+        .clear_color = .{ 0, 0, 0, 1 },
+        .drawable_size = .{ 640.0, 480.0 },
+        .quads = &.{},
+        .batches = &.{},
+        .clips = clips[0..],
+        .glyphs = glyphs[0..],
+        .text_batches = batches[0..],
+        .font = null,
+    };
+
+    var frame_data: TextFrameData = undefined;
+    try std.testing.expectError(CompileError.InvalidTextBatch, compileText(&scene, &frame_data));
+
+    batches[0].vertex_count = vertices_per_glyph;
+    batches[0].clip_index = 1;
+    try std.testing.expectError(CompileError.InvalidClipIndex, compileText(&scene, &frame_data));
 }
 
 test "scene builder rejects invalid geometry and capacity overflow" {
@@ -465,6 +532,7 @@ test "scene compiler rejects malformed scenes" {
         .batches = batches[0..],
         .clips = clips[0..],
         .glyphs = &.{},
+        .text_batches = &.{},
         .font = null,
     };
 

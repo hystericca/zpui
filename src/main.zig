@@ -1,5 +1,5 @@
-const zpui = @import("zpui");
+const zpui = @import("zpui-app");
 
 pub fn main() !void {
-    try zpui.runHelloWindow();
+    try zpui.initWindow(.{});
 }

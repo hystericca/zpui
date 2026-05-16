@@ -8,14 +8,16 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const zmtl4 = zmtl4_dep.module("zmtl4");
 
-    const zpui = b.addModule("zpui", .{
-        .root_source_file = b.path("src/zpui.zig"),
+    const core = b.addModule("zpui-core", .{
+        .root_source_file = b.path("src/core.zig"),
         .target = target,
         .optimize = optimize,
     });
-    zpui.addImport("zmtl4", zmtl4_dep.module("zmtl4"));
-    linkMacOSPlatform(b, zpui, target);
+
+    const app = addAppModule(b, "zpui-app", target, optimize, zmtl4);
+    _ = addAppModule(b, "zpui", target, optimize, zmtl4);
 
     const exe = b.addExecutable(.{
         .name = "zpui",
@@ -24,7 +26,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zpui", .module = zpui },
+                .{ .name = "zpui-app", .module = app },
             },
         }),
     });
@@ -35,14 +37,35 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
 
-    const run_step = b.step("run", "Run the ZPUI workspace shell demo");
+    const run_step = b.step("run", "Run the ZPUI host window");
     run_step.dependOn(&run_cmd.step);
 
-    const mod_tests = b.addTest(.{ .root_module = zpui });
-    const run_mod_tests = b.addRunArtifact(mod_tests);
+    const core_tests = b.addTest(.{ .root_module = core });
+    const run_core_tests = b.addRunArtifact(core_tests);
+
+    const app_tests = b.addTest(.{ .root_module = app });
+    const run_app_tests = b.addRunArtifact(app_tests);
 
     const test_step = b.step("test", "Run library tests");
-    test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_core_tests.step);
+    test_step.dependOn(&run_app_tests.step);
+}
+
+fn addAppModule(
+    b: *std.Build,
+    name: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    zmtl4: *std.Build.Module,
+) *std.Build.Module {
+    const module = b.addModule(name, .{
+        .root_source_file = b.path("src/zpui.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    module.addImport("zmtl4", zmtl4);
+    linkMacOSPlatform(b, module, target);
+    return module;
 }
 
 fn linkMacOSPlatform(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {

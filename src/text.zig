@@ -93,6 +93,38 @@ pub const PushResult = extern struct {
     glyph_count: u32 = 0,
 };
 
+pub const MeasureResult = extern struct {
+    advance: f32 = 0.0,
+    width: f32 = 0.0,
+    height: f32 = 0.0,
+    glyph_count: u32 = 0,
+};
+
+pub fn measureAscii(font: *const Font, bytes: []const u8) Error!MeasureResult {
+    var cursor: f32 = 0.0;
+    var glyph_count: u32 = 0;
+    var visual_right: f32 = 0.0;
+
+    for (bytes) |byte| {
+        if (byte == '\n' or byte == '\r' or byte == '\t') return Error.UnsupportedCodepoint;
+
+        const metric = try font.glyphForByte(byte);
+        if (metric.visible()) {
+            const right = cursor + metric.offset_x + @as(f32, @floatFromInt(metric.atlas_width));
+            visual_right = @max(visual_right, right);
+            glyph_count += 1;
+        }
+        cursor += metric.advance;
+    }
+
+    return .{
+        .advance = cursor,
+        .width = @max(cursor, visual_right),
+        .height = font.lineHeight(),
+        .glyph_count = glyph_count,
+    };
+}
+
 pub fn pushAscii(
     font: *const Font,
     out: []GlyphInstance,
@@ -140,6 +172,7 @@ comptime {
     std.debug.assert(@sizeOf(GlyphMetric) == 40);
     std.debug.assert(@sizeOf(AtlasRect) == 16);
     std.debug.assert(@sizeOf(GlyphInstance) == 48);
+    std.debug.assert(@sizeOf(MeasureResult) == 16);
 }
 
 test "ascii text emits visible glyph instances and advances over spaces" {
@@ -180,6 +213,33 @@ test "ascii text emits visible glyph instances and advances over spaces" {
     try std.testing.expectEqual(layout.Rect.init(23.0, 22.0, 7.0, 9.0), glyphs[1].rect);
 }
 
+test "ascii text measures advance without emitting glyphs" {
+    var font: Font = .{};
+    font.metrics = .{
+        .line_height = 16.0,
+    };
+    font.glyphs['A'] = .{
+        .codepoint = 'A',
+        .atlas_width = 7,
+        .atlas_height = 9,
+        .offset_x = 1.0,
+        .advance = 8.0,
+        .flags = glyph_present | glyph_visible,
+    };
+    font.glyphs[' '] = .{
+        .codepoint = ' ',
+        .advance = 4.0,
+        .flags = glyph_present,
+    };
+
+    const measured = try measureAscii(&font, "A A ");
+
+    try std.testing.expectEqual(@as(f32, 24.0), measured.advance);
+    try std.testing.expectEqual(@as(f32, 24.0), measured.width);
+    try std.testing.expectEqual(@as(f32, 16.0), measured.height);
+    try std.testing.expectEqual(@as(u32, 2), measured.glyph_count);
+}
+
 test "ascii text rejects missing glyphs and output overflow" {
     var font: Font = .{};
     font.glyphs['A'] = .{
@@ -193,4 +253,6 @@ test "ascii text rejects missing glyphs and output overflow" {
     var glyphs: [1]GlyphInstance = undefined;
     try std.testing.expectError(Error.MissingGlyph, pushAscii(&font, glyphs[0..], .{}, "B", .{}));
     try std.testing.expectError(Error.GlyphCapacityExceeded, pushAscii(&font, glyphs[0..], .{}, "AA", .{}));
+    try std.testing.expectError(Error.MissingGlyph, measureAscii(&font, "B"));
+    try std.testing.expectError(Error.UnsupportedCodepoint, measureAscii(&font, "\t"));
 }

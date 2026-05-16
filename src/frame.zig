@@ -6,6 +6,7 @@ const ui = @import("ui.zig");
 
 pub const Error = render.SceneBuildError || ui.layout.LayoutError || error{
     HitCapacityExceeded,
+    TextBatchCapacityExceeded,
 } || text.Error;
 
 pub const InputSnapshot = struct {
@@ -27,6 +28,7 @@ pub const Storage = struct {
     layout_results: [render.max_quads]ui.layout.LayoutResult = undefined,
     hit_items: [render.max_quads]ui.hit.HitItem = undefined,
     glyphs: [text.max_frame_glyphs]text.GlyphInstance = undefined,
+    text_batches: [render.max_text_batches]render.TextBatch = undefined,
     hit_state: ui.hit.HitState = .{},
 };
 
@@ -39,6 +41,7 @@ pub const Frame = struct {
     scene: render.SceneBuilder,
     hit_count: u32,
     glyph_count: u32,
+    text_batch_count: u32,
 
     pub fn begin(storage: *Storage, options: Begin) Frame {
         return .{
@@ -50,6 +53,7 @@ pub const Frame = struct {
             .scene = render.SceneBuilder.begin(&storage.scene, options.size, options.clear_color),
             .hit_count = 0,
             .glyph_count = 0,
+            .text_batch_count = 0,
         };
     }
 
@@ -109,8 +113,14 @@ pub const Frame = struct {
         return id;
     }
 
-    pub fn pushText(frame: *Frame, origin: ui.layout.Point, bytes: []const u8, color: ui.style.Color) Error!text.PushResult {
+    pub fn measureText(frame: *const Frame, bytes: []const u8) Error!text.MeasureResult {
         const font = frame.font orelse return text.Error.NoFont;
+        return text.measureAscii(font, bytes);
+    }
+
+    pub fn pushText(frame: *Frame, origin: ui.layout.Point, bytes: []const u8, color: ui.style.Color, clip_index: u32) Error!text.PushResult {
+        const font = frame.font orelse return text.Error.NoFont;
+        if (clip_index >= frame.scene.clip_count) return render.SceneBuildError.InvalidClipIndex;
         const used: usize = @intCast(frame.glyph_count);
         const result = try text.pushAscii(
             font,
@@ -119,12 +129,25 @@ pub const Frame = struct {
             bytes,
             color,
         );
+        if (result.glyph_count != 0) {
+            if (frame.text_batch_count >= render.max_text_batches) return Error.TextBatchCapacityExceeded;
+            frame.storage.text_batches[@intCast(frame.text_batch_count)] = .{
+                .vertex_start = frame.glyph_count * render.vertices_per_glyph,
+                .vertex_count = result.glyph_count * render.vertices_per_glyph,
+                .clip_index = clip_index,
+            };
+            frame.text_batch_count += 1;
+        }
         frame.glyph_count += result.glyph_count;
         return result;
     }
 
     pub fn glyphs(frame: *const Frame) []const text.GlyphInstance {
         return frame.storage.glyphs[0..@intCast(frame.glyph_count)];
+    }
+
+    pub fn textBatches(frame: *const Frame) []const render.TextBatch {
+        return frame.storage.text_batches[0..@intCast(frame.text_batch_count)];
     }
 
     pub fn endBatch(frame: *Frame) Error!void {
@@ -134,6 +157,7 @@ pub const Frame = struct {
     pub fn finish(frame: *Frame) Error!render.Scene {
         var scene = try frame.scene.finish();
         scene.glyphs = frame.glyphs();
+        scene.text_batches = frame.textBatches();
         scene.font = frame.font;
         return scene;
     }
@@ -282,20 +306,56 @@ test "frame pushes text into a caller-owned glyph stream" {
         .font = &font,
     });
 
-    const result = try frame.pushText(ui.layout.Point.init(12.0, 18.0), "zz", ui.style.Color.rgb(0.8, 0.8, 0.8));
+    const clip = try frame.pushDrawableClip();
+    const measured = try frame.measureText("zz");
+    const result = try frame.pushText(ui.layout.Point.init(12.0, 18.0), "zz", ui.style.Color.rgb(0.8, 0.8, 0.8), clip);
     const scene = try frame.finish();
 
+    try std.testing.expectEqual(@as(f32, 12.0), measured.advance);
+    try std.testing.expectEqual(@as(u32, 2), measured.glyph_count);
     try std.testing.expectEqual(@as(u32, 2), result.glyph_count);
     try std.testing.expectEqual(@as(usize, 2), frame.glyphs().len);
+    try std.testing.expectEqual(@as(usize, 1), frame.textBatches().len);
     try std.testing.expectEqual(@as(usize, 2), scene.glyphs.len);
+    try std.testing.expectEqual(@as(usize, 1), scene.text_batches.len);
     try std.testing.expectEqual(@as(?*const text.Font, &font), scene.font);
     try std.testing.expectEqual(ui.layout.Rect.init(12.0, 18.0, 5.0, 7.0), scene.glyphs[0].rect);
     try std.testing.expectEqual(ui.layout.Rect.init(18.0, 18.0, 5.0, 7.0), scene.glyphs[1].rect);
+
+    var invalid_clip_frame = Frame.begin(&storage, .{
+        .size = .{ 100.0, 100.0 },
+        .font = &font,
+    });
+    try std.testing.expectError(render.SceneBuildError.InvalidClipIndex, invalid_clip_frame.pushText(.{}, "z", .{}, 0));
 }
 
 test "frame push text requires an explicit font" {
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 100.0 } });
 
-    try std.testing.expectError(text.Error.NoFont, frame.pushText(.{}, "z", .{}));
+    try std.testing.expectError(text.Error.NoFont, frame.measureText("z"));
+    try std.testing.expectError(text.Error.NoFont, frame.pushText(.{}, "z", .{}, 0));
+}
+
+test "frame rejects text batch overflow" {
+    var font: text.Font = .{};
+    font.glyphs['z'] = .{
+        .codepoint = 'z',
+        .atlas_width = 1,
+        .atlas_height = 1,
+        .advance = 1.0,
+        .flags = text.glyph_present | text.glyph_visible,
+    };
+
+    var storage: Storage = .{};
+    var frame = Frame.begin(&storage, .{
+        .size = .{ 100.0, 100.0 },
+        .font = &font,
+    });
+    const clip = try frame.pushDrawableClip();
+
+    for (0..render.max_text_batches) |_| {
+        _ = try frame.pushText(.{}, "z", .{}, clip);
+    }
+    try std.testing.expectError(Error.TextBatchCapacityExceeded, frame.pushText(.{}, "z", .{}, clip));
 }
