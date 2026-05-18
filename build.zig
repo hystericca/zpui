@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.installArtifact(exe);
-    installMetalShaders(b, target);
+    installLocalRuntimeAssets(b, target);
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -84,11 +84,29 @@ fn linkMacOSPlatform(b: *std.Build, module: *std.Build.Module, target: std.Build
     module.linkSystemLibrary("objc", .{});
 }
 
-fn installMetalShaders(b: *std.Build, target: std.Build.ResolvedTarget) void {
+pub fn installRuntimeAssets(
+    b: *std.Build,
+    zpui_dep: *std.Build.Dependency,
+    exe: *std.Build.Step.Compile,
+) void {
+    if (exe.rootModuleTarget().os.tag != .macos) return;
+
+    const metallib = compileMetalLibrary(b, zpui_dep.path("src/shaders/solid_quad.metal"));
+    const install_shader = b.addInstallFileWithDir(metallib, .bin, "zpui.metallib");
+    b.getInstallStep().dependOn(&install_shader.step);
+}
+
+fn installLocalRuntimeAssets(b: *std.Build, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
 
+    const metallib = compileMetalLibrary(b, b.path("src/shaders/solid_quad.metal"));
+    const install_shader = b.addInstallFileWithDir(metallib, .bin, "zpui.metallib");
+    b.getInstallStep().dependOn(&install_shader.step);
+}
+
+fn compileMetalLibrary(b: *std.Build, shader: std.Build.LazyPath) std.Build.LazyPath {
     const compile_shader = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metal", "-c" });
-    compile_shader.addFileArg(b.path("src/shaders/solid_quad.metal"));
+    compile_shader.addFileArg(shader);
     compile_shader.addArg("-o");
     const air = compile_shader.addOutputFileArg("solid_quad.air");
 
@@ -96,7 +114,5 @@ fn installMetalShaders(b: *std.Build, target: std.Build.ResolvedTarget) void {
     link_shader.addFileArg(air);
     link_shader.addArg("-o");
     const metallib = link_shader.addOutputFileArg("zpui.metallib");
-
-    const install_shader = b.addInstallFileWithDir(metallib, .bin, "zpui.metallib");
-    b.getInstallStep().dependOn(&install_shader.step);
+    return metallib;
 }

@@ -1,10 +1,11 @@
 const std = @import("std");
 
 const mtl = @import("zmtl4");
+const mask = @import("mask.zig");
 const macos_text = @import("platform/macos_text.zig");
 const text = @import("text.zig");
 const ui_frame = @import("frame.zig");
-const render = @import("render.zig");
+const scene = @import("scene.zig");
 
 pub const ObjCId = mtl.runtime.Id;
 
@@ -17,28 +18,41 @@ pub const Error = mtl.Error || error{
     FrameEncodingFailed,
     FrameWaitTimedOut,
     InvalidClipRect,
+    InvalidFontOptions,
+    InvalidFontSlot,
     OutOfMemory,
-} || macos_text.Error;
+} || mask.Error || macos_text.Error;
 
 pub const max_frames_in_flight = 3;
-pub const frame_quad_cap = render.max_quads;
-pub const frame_buf_len = @sizeOf(render.FrameData);
-pub const text_frame_buf_len = @sizeOf(render.TextFrameData);
+pub const frame_quad_cap = scene.max_quads;
+pub const frame_buf_len = @sizeOf(scene.FrameData);
+pub const text_frame_buf_len = @sizeOf(scene.TextFrameData);
+pub const mask_frame_buf_len = @sizeOf(scene.MaskFrameData);
+pub const font_slot_count = text.max_font_slots;
 const frame_wait_timeout_ms = 10;
 const frame_drain_timeout_ms = 5_000;
-const residency_allocation_cap = max_frames_in_flight * 2 + 1;
+const mask_texture_index = text.max_font_slots;
+const residency_allocation_cap = max_frames_in_flight * 3 + text.max_font_slots + 1;
+
+pub const Options = struct {
+    layer: mtl.layer.Config = .{},
+};
 
 extern fn zpui_platform_create_shader_library(device: ObjCId) ObjCId;
 
 const GpuFrame = struct {
     buf: mtl.resource.OwnedBuffer,
-    data: *render.FrameData,
+    data: *scene.FrameData,
     addr: mtl.abi.GPUAddress,
     text_buf: mtl.resource.OwnedBuffer,
-    text_data: *render.TextFrameData,
+    text_data: *scene.TextFrameData,
     text_addr: mtl.abi.GPUAddress,
+    mask_buf: mtl.resource.OwnedBuffer,
+    mask_data: *scene.MaskFrameData,
+    mask_addr: mtl.abi.GPUAddress,
 
     fn deinit(frame: *GpuFrame) void {
+        frame.mask_buf.deinit();
         frame.text_buf.deinit();
         frame.buf.deinit();
     }
@@ -50,6 +64,9 @@ const Draw = struct {
     batch_count: u32,
     text_vertex_count: u32,
     text_batch_count: u32,
+    mask_vertex_count: u32,
+    mask_batch_count: u32,
+    command_count: u32,
 };
 
 pub const Status = enum(c_int) {
@@ -99,6 +116,16 @@ pub const Status = enum(c_int) {
     invalid_texture_size = 52,
     sampler_descriptor_creation_failed = 53,
     sampler_state_creation_failed = 54,
+    invalid_font_options = 55,
+    font_unavailable = 56,
+    font_registration_failed = 57,
+    invalid_font_data = 58,
+    invalid_font_slot = 59,
+    font_variation_unavailable = 60,
+    invalid_mask_id = 61,
+    invalid_mask = 62,
+    mask_atlas_full = 63,
+    mask_entry_capacity_exceeded = 64,
 
     pub fn fromError(err: Error) Status {
         return switch (err) {
@@ -143,6 +170,16 @@ pub const Status = enum(c_int) {
             Error.FrameEncodingFailed => .frame_encoding_failed,
             Error.FrameWaitTimedOut => .frame_wait_timed_out,
             Error.InvalidClipRect => .invalid_clip_rect,
+            Error.InvalidFontOptions => .invalid_font_options,
+            Error.InvalidFontSlot => .invalid_font_slot,
+            Error.FontUnavailable => .font_unavailable,
+            Error.FontVariationUnavailable => .font_variation_unavailable,
+            Error.FontRegistrationFailed => .font_registration_failed,
+            Error.InvalidFontData => .invalid_font_data,
+            Error.InvalidMaskId => .invalid_mask_id,
+            Error.InvalidMask => .invalid_mask,
+            Error.AtlasFull => .mask_atlas_full,
+            Error.EntryCapacityExceeded => .mask_entry_capacity_exceeded,
             Error.OutOfMemory => .out_of_memory,
             Error.FontAtlasCreationFailed => .font_atlas_creation_failed,
         };
@@ -157,12 +194,21 @@ pub const Surface = struct {
     command_buffer: mtl.command.OwnedCommandBuffer,
     pipeline_state: mtl.render.OwnedRenderPipelineState,
     text_pipeline_state: mtl.render.OwnedRenderPipelineState,
+    mask_pipeline_state: mtl.render.OwnedRenderPipelineState,
     command_allocators: [max_frames_in_flight]mtl.command.OwnedCommandAllocator,
     frames: [max_frames_in_flight]GpuFrame,
+    draw_commands: [scene.max_draw_commands]scene.DrawCommand = undefined,
     frame_storage: ui_frame.Storage = .{},
-    text_font: text.Font = .{},
-    text_atlas: text.AtlasStorage = .{},
-    text_texture: mtl.resource.OwnedTexture,
+    text_fonts: [text.max_font_slots]text.Font = [_]text.Font{.{}} ** text.max_font_slots,
+    text_atlases: [text.max_font_slots]text.AtlasStorage = [_]text.AtlasStorage{.{}} ** text.max_font_slots,
+    mask_atlas: mask.AtlasStorage = .{},
+    font_families: [text.max_font_slots][text.max_font_family_len + 1]u8 = [_][text.max_font_family_len + 1]u8{[_]u8{0} ** (text.max_font_family_len + 1)} ** text.max_font_slots,
+    font_family_lens: [text.max_font_slots]usize = [_]usize{0} ** text.max_font_slots,
+    font_sizes: [text.max_font_slots]f32 = [_]f32{text.default_font_size} ** text.max_font_slots,
+    font_variations: [text.max_font_slots][text.max_font_variations]text.FontVariation = [_][text.max_font_variations]text.FontVariation{[_]text.FontVariation{.{}} ** text.max_font_variations} ** text.max_font_slots,
+    font_variation_lens: [text.max_font_slots]usize = [_]usize{0} ** text.max_font_slots,
+    text_textures: [text.max_font_slots]mtl.resource.OwnedTexture,
+    mask_texture: mtl.resource.OwnedTexture,
     text_sampler: mtl.resource.OwnedSamplerState,
     argument_table: mtl.resource.OwnedArgumentTable,
     residency_set: mtl.resource.OwnedResidencySet,
@@ -180,6 +226,14 @@ pub const Surface = struct {
     }
 
     pub fn createWithAllocator(alloc: std.mem.Allocator, device: ObjCId, config: mtl.layer.Config) Error!*Surface {
+        return createWithOptions(alloc, device, .{ .layer = config });
+    }
+
+    pub fn createWithOptions(alloc: std.mem.Allocator, device: ObjCId, options: Options) Error!*Surface {
+        const config = options.layer;
+        const default_font = text.FontOptions{};
+        const font_family = try storeFontFamily(default_font.family);
+
         const device_ref = mtl.Device.fromRaw(device orelse return Error.InvalidDevice);
         var owned_device = try mtl.retain(.device, device_ref);
         errdefer owned_device.deinit();
@@ -203,6 +257,9 @@ pub const Surface = struct {
         var text_pipeline_state = try createTextPipeline(owned_device.ref(), config.pixel_format);
         errdefer text_pipeline_state.deinit();
 
+        var mask_pipeline_state = try createMaskPipeline(owned_device.ref(), config.pixel_format);
+        errdefer mask_pipeline_state.deinit();
+
         var command_allocators: [max_frames_in_flight]mtl.command.OwnedCommandAllocator = undefined;
         var allocator_count: usize = 0;
         errdefer {
@@ -214,12 +271,36 @@ pub const Surface = struct {
             command_allocators[allocator_count] = try mtl.command.createAllocator(owned_device.ref());
         }
 
-        var text_font: text.Font = .{};
-        var text_atlas: text.AtlasStorage = .{};
-        try macos_text.buildAsciiAtlas(&text_font, &text_atlas, "JetBrains Mono", 13.0, 2.0);
+        var text_fonts: [text.max_font_slots]text.Font = [_]text.Font{.{}} ** text.max_font_slots;
+        var text_atlases: [text.max_font_slots]text.AtlasStorage = [_]text.AtlasStorage{.{}} ** text.max_font_slots;
+        var text_textures: [text.max_font_slots]mtl.resource.OwnedTexture = undefined;
+        var text_texture_count: usize = 0;
+        errdefer {
+            for (text_textures[0..text_texture_count]) |*texture| {
+                texture.deinit();
+            }
+        }
+        while (text_texture_count < text.max_font_slots) : (text_texture_count += 1) {
+            try buildTextAtlas(&text_fonts[text_texture_count], &text_atlases[text_texture_count], default_font, 2.0);
+            text_textures[text_texture_count] = try createTextTexture(owned_device.ref(), &text_atlases[text_texture_count]);
+        }
 
-        var text_texture = try createTextTexture(owned_device.ref(), &text_atlas);
-        errdefer text_texture.deinit();
+        var font_families: [text.max_font_slots][text.max_font_family_len + 1]u8 = undefined;
+        var font_family_lens: [text.max_font_slots]usize = undefined;
+        var font_sizes: [text.max_font_slots]f32 = undefined;
+        var font_variations: [text.max_font_slots][text.max_font_variations]text.FontVariation = undefined;
+        var font_variation_lens: [text.max_font_slots]usize = undefined;
+        for (0..text.max_font_slots) |slot| {
+            font_families[slot] = font_family;
+            font_family_lens[slot] = default_font.family.len;
+            font_sizes[slot] = default_font.size;
+            font_variations[slot] = [_]text.FontVariation{.{}} ** text.max_font_variations;
+            font_variation_lens[slot] = 0;
+        }
+
+        var mask_atlas: mask.AtlasStorage = .{};
+        var mask_texture = try createMaskTexture(owned_device.ref(), &mask_atlas);
+        errdefer mask_texture.deinit();
 
         var text_sampler = try mtl.resource.createSamplerState(owned_device.ref(), .{});
         errdefer text_sampler.deinit();
@@ -238,11 +319,16 @@ pub const Surface = struct {
             frames[frame_count] = try createFrame(owned_device.ref());
             const buf = frames[frame_count].buf;
             const text_buf = frames[frame_count].text_buf;
+            const mask_buf = frames[frame_count].mask_buf;
             frame_count += 1;
             mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(buf.raw));
             mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(text_buf.raw));
+            mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(mask_buf.raw));
         }
-        mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(text_texture.raw));
+        for (&text_textures) |*texture| {
+            mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(texture.raw));
+        }
+        mtl.resource.addAllocation(residency_set.ref(), mtl.runtime.Object.fromRaw(mask_texture.raw));
         mtl.resource.commit(residency_set.ref());
         mtl.resource.requestResidency(residency_set.ref());
         errdefer mtl.resource.endResidency(residency_set.ref());
@@ -250,12 +336,15 @@ pub const Surface = struct {
         errdefer mtl.command.removeResidencySet(command_queue.ref(), residency_set.ref());
 
         var argument_table = try mtl.resource.createArgumentTableWithConfig(owned_device.ref(), .{
-            .max_buffer_bind_count = 2,
-            .max_texture_bind_count = 1,
+            .max_buffer_bind_count = 3,
+            .max_texture_bind_count = text.max_font_slots + 1,
             .max_sampler_state_bind_count = 1,
         });
         errdefer argument_table.deinit();
-        mtl.resource.setTexture(argument_table.ref(), mtl.resource.gpuResourceId(text_texture.ref()), 0);
+        for (&text_textures, 0..) |*texture, slot| {
+            mtl.resource.setTexture(argument_table.ref(), mtl.resource.gpuResourceId(texture.ref()), @intCast(slot));
+        }
+        mtl.resource.setTexture(argument_table.ref(), mtl.resource.gpuResourceId(mask_texture.ref()), mask_texture_index);
         mtl.resource.setSamplerState(argument_table.ref(), mtl.resource.gpuResourceIdSampler(text_sampler.ref()), 0);
 
         var frame_event = try mtl.resource.createSharedEvent(owned_device.ref());
@@ -271,12 +360,21 @@ pub const Surface = struct {
             .command_buffer = command_buffer,
             .pipeline_state = pipeline_state,
             .text_pipeline_state = text_pipeline_state,
+            .mask_pipeline_state = mask_pipeline_state,
             .command_allocators = command_allocators,
             .frames = frames,
+            .draw_commands = undefined,
             .frame_storage = .{},
-            .text_font = text_font,
-            .text_atlas = text_atlas,
-            .text_texture = text_texture,
+            .text_fonts = text_fonts,
+            .text_atlases = text_atlases,
+            .mask_atlas = mask_atlas,
+            .font_families = font_families,
+            .font_family_lens = font_family_lens,
+            .font_sizes = font_sizes,
+            .font_variations = font_variations,
+            .font_variation_lens = font_variation_lens,
+            .text_textures = text_textures,
+            .mask_texture = mask_texture,
             .text_sampler = text_sampler,
             .argument_table = argument_table,
             .residency_set = residency_set,
@@ -304,7 +402,11 @@ pub const Surface = struct {
         }
         surface.frame_event.deinit();
         surface.text_sampler.deinit();
-        surface.text_texture.deinit();
+        surface.mask_texture.deinit();
+        for (&surface.text_textures) |*texture| {
+            texture.deinit();
+        }
+        surface.mask_pipeline_state.deinit();
         surface.text_pipeline_state.deinit();
         surface.pipeline_state.deinit();
         surface.command_buffer.deinit();
@@ -314,16 +416,95 @@ pub const Surface = struct {
         alloc.destroy(surface);
     }
 
+    pub fn fonts(surface: *const Surface) []const text.Font {
+        return surface.text_fonts[0..];
+    }
+
+    fn fontOptions(surface: *const Surface, slot: u32) Error!text.FontOptions {
+        const index = try fontSlotIndex(slot);
+        return .{
+            .family = surface.font_families[index][0..surface.font_family_lens[index] :0],
+            .size = surface.font_sizes[index],
+            .variations = surface.font_variations[index][0..surface.font_variation_lens[index]],
+        };
+    }
+
+    pub fn resolvedFontName(surface: *const Surface) []const u8 {
+        return surface.resolvedFontNameSlot(text.default_font_slot) catch "";
+    }
+
+    pub fn resolvedFontNameSlot(surface: *const Surface, slot: u32) Error![]const u8 {
+        const index = try fontSlotIndex(slot);
+        return surface.text_fonts[index].resolvedName();
+    }
+
+    pub fn setFont(surface: *Surface, options: text.FontOptions) Error!void {
+        try surface.setFontSlot(text.default_font_slot, options);
+    }
+
+    pub fn maskAtlas(surface: *const Surface) *const mask.AtlasStorage {
+        return &surface.mask_atlas;
+    }
+
+    pub fn maskAtlasRect(surface: *const Surface, id: u32) Error!mask.AtlasRect {
+        return surface.mask_atlas.rect(id);
+    }
+
+    pub fn setMaskAtlas(surface: *Surface, atlas: *const mask.AtlasStorage) Error!void {
+        if (!atlas.valid()) return Error.InvalidMask;
+        surface.drain();
+        surface.mask_atlas = atlas.*;
+        uploadMaskAtlas(surface.mask_texture.ref(), &surface.mask_atlas);
+    }
+
+    pub fn setFontSlot(surface: *Surface, slot: u32, options: text.FontOptions) Error!void {
+        const index = try fontSlotIndex(slot);
+        if (!options.valid()) return Error.InvalidFontOptions;
+        if (surface.font_sizes[index] == options.size and
+            std.mem.eql(u8, surface.font_families[index][0..surface.font_family_lens[index]], options.family) and
+            fontVariationsEqual(surface.font_variations[index][0..surface.font_variation_lens[index]], options.variations))
+        {
+            return;
+        }
+
+        const next_family = try storeFontFamily(options.family);
+        const next_variations = try storeFontVariations(options.variations);
+        const scale32: f32 = @floatCast(surface.scale);
+        var next_font: text.Font = .{};
+        var next_atlas: text.AtlasStorage = .{};
+        try buildTextAtlas(&next_font, &next_atlas, options, scale32);
+
+        surface.drain();
+        surface.text_fonts[index] = next_font;
+        surface.text_atlases[index] = next_atlas;
+        surface.font_families[index] = next_family;
+        surface.font_family_lens[index] = options.family.len;
+        surface.font_sizes[index] = options.size;
+        surface.font_variations[index] = next_variations;
+        surface.font_variation_lens[index] = options.variations.len;
+        uploadTextAtlas(surface.text_textures[index].ref(), &surface.text_atlases[index]);
+    }
+
     pub fn resize(surface: *Surface, drawable_size: mtl.abi.Size2D, scale: mtl.abi.CGFloat) Error!void {
+        if (surface.drawable_size.width == drawable_size.width and
+            surface.drawable_size.height == drawable_size.height and
+            surface.scale == scale)
+        {
+            return;
+        }
+
         try mtl.layer.resize(surface.layer.ref(), drawable_size, scale);
         const scale32: f32 = @floatCast(scale);
-        if (surface.text_font.metrics.scale != scale32) {
-            var next_font: text.Font = .{};
-            var next_atlas: text.AtlasStorage = .{};
-            try macos_text.buildAsciiAtlas(&next_font, &next_atlas, "JetBrains Mono", 13.0, scale32);
-            surface.text_font = next_font;
-            surface.text_atlas = next_atlas;
-            uploadTextAtlas(surface.text_texture.ref(), &surface.text_atlas);
+        if (surface.text_fonts[0].metrics.scale != scale32) {
+            surface.drain();
+            for (0..text.max_font_slots) |index| {
+                var next_font: text.Font = .{};
+                var next_atlas: text.AtlasStorage = .{};
+                try buildTextAtlas(&next_font, &next_atlas, try surface.fontOptions(@intCast(index)), scale32);
+                surface.text_fonts[index] = next_font;
+                surface.text_atlases[index] = next_atlas;
+                uploadTextAtlas(surface.text_textures[index].ref(), &surface.text_atlases[index]);
+            }
         }
         surface.drawable_size = drawable_size;
         surface.scale = scale;
@@ -352,10 +533,10 @@ pub const Surface = struct {
         surface.current_frame_index +%= 1;
     }
 
-    pub fn drawScene(surface: *Surface, scene: *const render.Scene, drawable_id: ObjCId) Error!void {
+    pub fn drawScene(surface: *Surface, frame_scene: *const scene.Scene, drawable_id: ObjCId) Error!void {
         const drawable = mtl.layer.Drawable.fromRaw(drawable_id orelse return Error.DrawableUnavailable);
         const command_allocator = try surface.nextCommandAllocator();
-        const prepared = try surface.prepareScene(scene);
+        const prepared = try surface.prepareScene(frame_scene);
         const drawable_texture = try mtl.layer.drawableTexture(drawable);
         var pass_descriptor = try mtl.render.createColorPassDescriptor(drawable_texture, prepared.clear_color);
         defer pass_descriptor.deinit();
@@ -382,43 +563,7 @@ pub const Surface = struct {
             mtl.abi.render_stage_vertex | mtl.abi.render_stage_fragment,
         );
 
-        if (prepared.draw_vertex_count > 0 and prepared.batch_count > 0) {
-            mtl.render.setPipelineState(encoder, surface.pipeline_state.ref());
-            for (scene.batches) |batch| {
-                const clip = scene.clips[@intCast(batch.clip_index)];
-                mtl.render.setScissorRect(encoder, .{
-                    .x = clip.x,
-                    .y = clip.y,
-                    .width = clip.width,
-                    .height = clip.height,
-                });
-                mtl.render.drawPrimitives(
-                    encoder,
-                    .triangle,
-                    @intCast(batch.vertex_start),
-                    @intCast(batch.vertex_count),
-                );
-            }
-        }
-
-        if (prepared.text_vertex_count > 0 and prepared.text_batch_count > 0) {
-            mtl.render.setPipelineState(encoder, surface.text_pipeline_state.ref());
-            for (scene.text_batches) |batch| {
-                const clip = scene.clips[@intCast(batch.clip_index)];
-                mtl.render.setScissorRect(encoder, .{
-                    .x = clip.x,
-                    .y = clip.y,
-                    .width = clip.width,
-                    .height = clip.height,
-                });
-                mtl.render.drawPrimitives(
-                    encoder,
-                    .triangle,
-                    @intCast(batch.vertex_start),
-                    @intCast(batch.vertex_count),
-                );
-            }
-        }
+        try surface.drawPreparedScene(encoder, frame_scene, prepared);
 
         mtl.render.endEncoding(encoder);
         encoder_open = false;
@@ -432,36 +577,76 @@ pub const Surface = struct {
         mtl.layer.present(drawable);
     }
 
-    fn prepareScene(surface: *Surface, scene: *const render.Scene) Error!Draw {
+    fn prepareScene(surface: *Surface, frame_scene: *const scene.Scene) Error!Draw {
         const frame_slot = surface.currentFrameSlot();
         const frame = &surface.frames[frame_slot];
 
-        const compiled = render.compileScene(scene, frame.data) catch return Error.FrameEncodingFailed;
-        const text_compiled = render.compileText(scene, frame.text_data) catch return Error.FrameEncodingFailed;
+        const compiled = scene.compileScene(frame_scene, frame.data) catch return Error.FrameEncodingFailed;
+        const text_compiled = scene.compileText(frame_scene, frame.text_data) catch return Error.FrameEncodingFailed;
+        const mask_compiled = scene.compileMasks(frame_scene, frame.mask_data) catch return Error.FrameEncodingFailed;
         if (compiled.quad_count > frame_quad_cap) return Error.BufferCreationFailed;
+        const command_count = try surface.buildDrawCommands(frame_scene);
 
         mtl.resource.setAddress(surface.argument_table.ref(), frame.addr, 0);
         mtl.resource.setAddress(surface.argument_table.ref(), frame.text_addr, 1);
+        mtl.resource.setAddress(surface.argument_table.ref(), frame.mask_addr, 2);
 
-        if (compiled.draw_vertex_count > 0 and compiled.batch_count > 0) {
-            for (scene.batches) |batch| {
-                const clip = scene.clips[@intCast(batch.clip_index)];
-                try validateClipRect(clip, surface.drawable_size);
-            }
-        }
-        if (text_compiled.draw_vertex_count > 0) {
-            for (scene.text_batches) |batch| {
-                const clip = scene.clips[@intCast(batch.clip_index)];
-                try validateClipRect(clip, surface.drawable_size);
-            }
-        }
         return .{
-            .clear_color = toClearColor(scene.clear_color),
+            .clear_color = toClearColor(frame_scene.clear_color),
             .draw_vertex_count = compiled.draw_vertex_count,
             .batch_count = compiled.batch_count,
             .text_vertex_count = text_compiled.draw_vertex_count,
             .text_batch_count = text_compiled.batch_count,
+            .mask_vertex_count = mask_compiled.draw_vertex_count,
+            .mask_batch_count = mask_compiled.batch_count,
+            .command_count = command_count,
         };
+    }
+
+    fn buildDrawCommands(surface: *Surface, frame_scene: *const scene.Scene) Error!u32 {
+        const total = frame_scene.batches.len + frame_scene.mask_batches.len + frame_scene.text_batches.len;
+        if (total > scene.max_draw_commands) return Error.FrameEncodingFailed;
+
+        var count: usize = 0;
+        for (frame_scene.batches) |batch| {
+            try validateClipRect(frame_scene.clips[@intCast(batch.clip_index)], frame_scene.drawable_size);
+            surface.draw_commands[count] = .{
+                .vertex_start = batch.vertex_start,
+                .vertex_count = batch.vertex_count,
+                .clip_index = batch.clip_index,
+                .layer = batch.layer,
+                .order = batch.order,
+                .kind = .quad,
+            };
+            count += 1;
+        }
+        for (frame_scene.mask_batches) |batch| {
+            try validateClipRect(frame_scene.clips[@intCast(batch.clip_index)], frame_scene.drawable_size);
+            surface.draw_commands[count] = .{
+                .vertex_start = batch.vertex_start,
+                .vertex_count = batch.vertex_count,
+                .clip_index = batch.clip_index,
+                .layer = batch.layer,
+                .order = batch.order,
+                .kind = .mask,
+            };
+            count += 1;
+        }
+        for (frame_scene.text_batches) |batch| {
+            try validateClipRect(frame_scene.clips[@intCast(batch.clip_index)], frame_scene.drawable_size);
+            surface.draw_commands[count] = .{
+                .vertex_start = batch.vertex_start,
+                .vertex_count = batch.vertex_count,
+                .clip_index = batch.clip_index,
+                .layer = batch.layer,
+                .order = batch.order,
+                .kind = .text,
+            };
+            count += 1;
+        }
+
+        std.mem.sort(scene.DrawCommand, surface.draw_commands[0..count], {}, drawCommandLessThan);
+        return @intCast(count);
     }
 
     fn currentFrameSlot(surface: *const Surface) usize {
@@ -474,7 +659,45 @@ pub const Surface = struct {
             mtl.command.useLayerResidencySet(surface.command_buffer.ref(), layer_residency_set);
         }
     }
+
+    fn drawPreparedScene(surface: *Surface, encoder: mtl.render.RenderEncoder, frame_scene: *const scene.Scene, prepared: Draw) Error!void {
+        var current_kind: ?scene.DrawKind = null;
+        for (surface.draw_commands[0..@intCast(prepared.command_count)]) |command| {
+            if (current_kind == null or current_kind.? != command.kind) {
+                switch (command.kind) {
+                    .quad => mtl.render.setPipelineState(encoder, surface.pipeline_state.ref()),
+                    .mask => mtl.render.setPipelineState(encoder, surface.mask_pipeline_state.ref()),
+                    .text => mtl.render.setPipelineState(encoder, surface.text_pipeline_state.ref()),
+                }
+                current_kind = command.kind;
+            }
+            try drawBatch(encoder, frame_scene.clips[@intCast(command.clip_index)], surface.scale, surface.drawable_size, command.vertex_start, command.vertex_count);
+        }
+    }
 };
+
+fn drawCommandLessThan(_: void, lhs: scene.DrawCommand, rhs: scene.DrawCommand) bool {
+    if (lhs.layer != rhs.layer) return lhs.layer < rhs.layer;
+    if (lhs.order != rhs.order) return lhs.order < rhs.order;
+    return @intFromEnum(lhs.kind) < @intFromEnum(rhs.kind);
+}
+
+fn drawBatch(
+    encoder: mtl.render.RenderEncoder,
+    clip: scene.ClipRect,
+    scale: mtl.abi.CGFloat,
+    drawable_size: mtl.abi.Size2D,
+    vertex_start: u32,
+    vertex_count: u32,
+) Error!void {
+    mtl.render.setScissorRect(encoder, try physicalScissorRect(clip, scale, drawable_size));
+    mtl.render.drawPrimitives(
+        encoder,
+        .triangle,
+        @intCast(vertex_start),
+        @intCast(vertex_count),
+    );
+}
 
 fn createSolidQuadPipeline(
     device: mtl.Device,
@@ -487,6 +710,7 @@ fn createSolidQuadPipeline(
 
     return mtl.render.createPipelineStateFromLibrary(device, library.ref(), "zpui_vertex", "zpui_fragment", .{
         .pixel_format = pixel_format,
+        .blend = .{ .enabled = true },
     });
 }
 
@@ -500,6 +724,21 @@ fn createTextPipeline(
     defer library.deinit();
 
     return mtl.render.createPipelineStateFromLibrary(device, library.ref(), "zpui_text_vertex", "zpui_text_fragment", .{
+        .pixel_format = pixel_format,
+        .blend = .{ .enabled = true },
+    });
+}
+
+fn createMaskPipeline(
+    device: mtl.Device,
+    pixel_format: mtl.abi.PixelFormat,
+) Error!mtl.render.OwnedRenderPipelineState {
+    var library = mtl.render.OwnedLibrary.fromRaw(
+        zpui_platform_create_shader_library(device.raw) orelse return Error.ShaderLibraryCreationFailed,
+    );
+    defer library.deinit();
+
+    return mtl.render.createPipelineStateFromLibrary(device, library.ref(), "zpui_mask_vertex", "zpui_mask_fragment", .{
         .pixel_format = pixel_format,
         .blend = .{ .enabled = true },
     });
@@ -520,13 +759,23 @@ fn createFrame(device: mtl.Device) Error!GpuFrame {
     );
     errdefer text_buf.deinit();
 
+    var mask_buf = try mtl.resource.createBuffer(
+        device,
+        mask_frame_buf_len,
+        mtl.abi.shared_write_combined_buffer_options,
+    );
+    errdefer mask_buf.deinit();
+
     return .{
         .buf = buf,
-        .data = try bufferContentsAs(buf.ref(), render.FrameData),
+        .data = try bufferContentsAs(buf.ref(), scene.FrameData),
         .addr = mtl.resource.gpuAddress(buf.ref()),
         .text_buf = text_buf,
-        .text_data = try bufferContentsAs(text_buf.ref(), render.TextFrameData),
+        .text_data = try bufferContentsAs(text_buf.ref(), scene.TextFrameData),
         .text_addr = mtl.resource.gpuAddress(text_buf.ref()),
+        .mask_buf = mask_buf,
+        .mask_data = try bufferContentsAs(mask_buf.ref(), scene.MaskFrameData),
+        .mask_addr = mtl.resource.gpuAddress(mask_buf.ref()),
     };
 }
 
@@ -549,6 +798,20 @@ fn createTextTexture(device: mtl.Device, atlas: *const text.AtlasStorage) Error!
     return texture;
 }
 
+fn createMaskTexture(device: mtl.Device, atlas: *const mask.AtlasStorage) Error!mtl.resource.OwnedTexture {
+    var texture = try mtl.resource.createTexture(device, .{
+        .width = mask.atlas_width,
+        .height = mask.atlas_height,
+        .pixel_format = .r8_unorm,
+        .usage = mtl.abi.texture_usage_shader_read,
+        .storage_mode = .shared,
+    });
+    errdefer texture.deinit();
+
+    uploadMaskAtlas(texture.ref(), atlas);
+    return texture;
+}
+
 fn uploadTextAtlas(texture: mtl.resource.Texture, atlas: *const text.AtlasStorage) void {
     mtl.resource.replaceRegion(
         texture,
@@ -562,21 +825,76 @@ fn uploadTextAtlas(texture: mtl.resource.Texture, atlas: *const text.AtlasStorag
     );
 }
 
-fn validateClipRect(clip: render.ClipRect, drawable_size: mtl.abi.Size2D) Error!void {
+fn uploadMaskAtlas(texture: mtl.resource.Texture, atlas: *const mask.AtlasStorage) void {
+    mtl.resource.replaceRegion(
+        texture,
+        .{
+            .origin = .{ .x = 0, .y = 0, .z = 0 },
+            .size = .{ .width = mask.atlas_width, .height = mask.atlas_height, .depth = 1 },
+        },
+        0,
+        atlas.bytes[0..].ptr,
+        mask.atlas_width,
+    );
+}
+
+fn validateClipRect(clip: scene.ClipRect, drawable_size: [2]f32) Error!void {
     if (clip.width == 0 or clip.height == 0) return Error.InvalidClipRect;
 
-    const drawable_width = try drawableExtent(drawable_size.width);
-    const drawable_height = try drawableExtent(drawable_size.height);
+    const drawable_width = try sceneExtent(drawable_size[0]);
+    const drawable_height = try sceneExtent(drawable_size[1]);
     if (clip.x > drawable_width or clip.width > drawable_width - clip.x) return Error.InvalidClipRect;
     if (clip.y > drawable_height or clip.height > drawable_height - clip.y) return Error.InvalidClipRect;
 }
 
-fn drawableExtent(value: f64) Error!u32 {
-    if (value <= 0) return Error.InvalidDrawableSize;
+fn physicalScissorRect(clip: scene.ClipRect, scale: mtl.abi.CGFloat, drawable_size: mtl.abi.Size2D) Error!mtl.abi.ScissorRect {
+    if (scale <= 0.0 or !std.math.isFinite(scale)) return Error.InvalidScale;
+
+    const drawable_width = try drawableExtent(drawable_size.width);
+    const drawable_height = try drawableExtent(drawable_size.height);
+    const x0 = @floor(@as(f64, @floatFromInt(clip.x)) * scale);
+    const y0 = @floor(@as(f64, @floatFromInt(clip.y)) * scale);
+    const x1 = @ceil((@as(f64, @floatFromInt(clip.x)) + @as(f64, @floatFromInt(clip.width))) * scale);
+    const y1 = @ceil((@as(f64, @floatFromInt(clip.y)) + @as(f64, @floatFromInt(clip.height))) * scale);
+    if (x1 <= x0 or y1 <= y0) return Error.InvalidClipRect;
+    if (x0 < 0.0 or y0 < 0.0) return Error.InvalidClipRect;
+
+    const x = try checkedScissorExtent(x0);
+    const y = try checkedScissorExtent(y0);
+    const width = try checkedScissorExtent(x1 - x0);
+    const height = try checkedScissorExtent(y1 - y0);
+    if (x > drawable_width or width > drawable_width - x) return Error.InvalidClipRect;
+    if (y > drawable_height or height > drawable_height - y) return Error.InvalidClipRect;
+
+    return .{
+        .x = @intCast(x),
+        .y = @intCast(y),
+        .width = @intCast(width),
+        .height = @intCast(height),
+    };
+}
+
+fn sceneExtent(value: f32) Error!u32 {
+    if (value <= 0.0 or !std.math.isFinite(value)) return Error.InvalidDrawableSize;
     const floored = @floor(value);
-    if (floored <= 0) return Error.InvalidDrawableSize;
+    if (floored <= 0.0) return Error.InvalidDrawableSize;
+    const max_exact_u32_f32: f32 = 4_294_967_040.0;
+    if (floored >= max_exact_u32_f32) return std.math.maxInt(u32);
+    return @intFromFloat(floored);
+}
+
+fn drawableExtent(value: f64) Error!u32 {
+    if (value <= 0.0 or !std.math.isFinite(value)) return Error.InvalidDrawableSize;
+    const floored = @floor(value);
+    if (floored <= 0.0) return Error.InvalidDrawableSize;
     const capped = @min(floored, @as(f64, @floatFromInt(std.math.maxInt(u32))));
     return @intFromFloat(capped);
+}
+
+fn checkedScissorExtent(value: f64) Error!u32 {
+    if (value < 0.0 or !std.math.isFinite(value)) return Error.InvalidClipRect;
+    if (value > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return Error.InvalidClipRect;
+    return @intFromFloat(value);
 }
 
 fn toClearColor(color: [4]f64) mtl.abi.ClearColor {
@@ -586,6 +904,47 @@ fn toClearColor(color: [4]f64) mtl.abi.ClearColor {
         .blue = color[2],
         .alpha = color[3],
     };
+}
+
+fn storeFontFamily(family: [:0]const u8) Error![text.max_font_family_len + 1]u8 {
+    if (family.len == 0 or family.len > text.max_font_family_len) return Error.InvalidFontOptions;
+
+    var stored = [_]u8{0} ** (text.max_font_family_len + 1);
+    @memcpy(stored[0..family.len], family);
+    return stored;
+}
+
+fn storeFontVariations(variations: []const text.FontVariation) Error![text.max_font_variations]text.FontVariation {
+    if (variations.len > text.max_font_variations) return Error.InvalidFontOptions;
+
+    var stored = [_]text.FontVariation{.{}} ** text.max_font_variations;
+    for (variations, 0..) |variation, index| {
+        if (!variation.valid()) return Error.InvalidFontOptions;
+        for (variations[0..index]) |previous| {
+            if (previous.tag == variation.tag) return Error.InvalidFontOptions;
+        }
+        stored[index] = variation;
+    }
+    return stored;
+}
+
+fn fontVariationsEqual(a: []const text.FontVariation, b: []const text.FontVariation) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |lhs, rhs| {
+        if (lhs.tag != rhs.tag or lhs.value != rhs.value) return false;
+    }
+    return true;
+}
+
+fn fontSlotIndex(slot: u32) Error!usize {
+    const index: usize = @intCast(slot);
+    if (index >= text.max_font_slots) return Error.InvalidFontSlot;
+    return index;
+}
+
+fn buildTextAtlas(font: *text.Font, atlas: *text.AtlasStorage, options: text.FontOptions, scale: f32) Error!void {
+    if (!options.valid() or scale <= 0.0 or !std.math.isFinite(scale)) return Error.InvalidFontOptions;
+    try macos_text.buildAsciiAtlas(font, atlas, options, scale);
 }
 
 pub export fn zpui_surface_create(device: ObjCId, out_surface: *?*Surface) c_int {
@@ -633,24 +992,117 @@ test "surface status values stay stable across the Objective-C ABI" {
     try std.testing.expectEqual(Status.texture_creation_failed, Status.fromError(Error.TextureCreationFailed));
     try std.testing.expectEqual(Status.sampler_state_creation_failed, Status.fromError(Error.SamplerStateCreationFailed));
     try std.testing.expectEqual(Status.invalid_texture_size, Status.fromError(Error.InvalidTextureSize));
+    try std.testing.expectEqual(Status.invalid_font_options, Status.fromError(Error.InvalidFontOptions));
+    try std.testing.expectEqual(Status.invalid_font_slot, Status.fromError(Error.InvalidFontSlot));
+    try std.testing.expectEqual(Status.font_unavailable, Status.fromError(Error.FontUnavailable));
+    try std.testing.expectEqual(Status.font_registration_failed, Status.fromError(Error.FontRegistrationFailed));
+    try std.testing.expectEqual(Status.invalid_font_data, Status.fromError(Error.InvalidFontData));
     try std.testing.expectEqual(Status.frame_encoding_failed, Status.fromError(Error.FrameEncodingFailed));
     try std.testing.expectEqual(Status.frame_wait_timed_out, Status.fromError(Error.FrameWaitTimedOut));
     try std.testing.expectEqual(Status.invalid_clip_rect, Status.fromError(Error.InvalidClipRect));
     try std.testing.expectEqual(Status.render_encoder_creation_failed, Status.fromError(Error.CommandEncoderCreationFailed));
     try std.testing.expectEqual(Status.out_of_memory, Status.fromError(Error.OutOfMemory));
+    try std.testing.expectEqual(@as(c_int, 55), @intFromEnum(Status.invalid_font_options));
+    try std.testing.expectEqual(@as(c_int, 56), @intFromEnum(Status.font_unavailable));
+    try std.testing.expectEqual(@as(c_int, 58), @intFromEnum(Status.invalid_font_data));
+    try std.testing.expectEqual(@as(c_int, 59), @intFromEnum(Status.invalid_font_slot));
+    try std.testing.expectEqual(@as(c_int, 60), @intFromEnum(Status.font_variation_unavailable));
+    try std.testing.expectEqual(Status.font_variation_unavailable, Status.fromError(Error.FontVariationUnavailable));
+    try std.testing.expectEqual(@as(c_int, 61), @intFromEnum(Status.invalid_mask_id));
+    try std.testing.expectEqual(@as(c_int, 62), @intFromEnum(Status.invalid_mask));
+    try std.testing.expectEqual(@as(c_int, 63), @intFromEnum(Status.mask_atlas_full));
+    try std.testing.expectEqual(@as(c_int, 64), @intFromEnum(Status.mask_entry_capacity_exceeded));
+    try std.testing.expectEqual(Status.invalid_mask_id, Status.fromError(Error.InvalidMaskId));
+    try std.testing.expectEqual(Status.invalid_mask, Status.fromError(Error.InvalidMask));
+    try std.testing.expectEqual(Status.mask_atlas_full, Status.fromError(Error.AtlasFull));
+    try std.testing.expectEqual(Status.mask_entry_capacity_exceeded, Status.fromError(Error.EntryCapacityExceeded));
 }
 
 test "surface clip validation rejects scissors outside the drawable" {
-    try validateClipRect(.{ .x = 0, .y = 0, .width = 640, .height = 480 }, .{ .width = 640, .height = 480 });
-    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 0, .y = 0, .width = 641, .height = 480 }, .{ .width = 640, .height = 480 }));
-    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 640, .y = 0, .width = 1, .height = 480 }, .{ .width = 640, .height = 480 }));
-    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 0, .y = 0, .width = 0, .height = 480 }, .{ .width = 640, .height = 480 }));
-    try std.testing.expectError(Error.InvalidDrawableSize, validateClipRect(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{ .width = 0, .height = 480 }));
+    try validateClipRect(.{ .x = 0, .y = 0, .width = 640, .height = 480 }, .{ 640.0, 480.0 });
+    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 0, .y = 0, .width = 641, .height = 480 }, .{ 640.0, 480.0 }));
+    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 640, .y = 0, .width = 1, .height = 480 }, .{ 640.0, 480.0 }));
+    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 0, .y = 0, .width = 0, .height = 480 }, .{ 640.0, 480.0 }));
+    try std.testing.expectError(Error.InvalidDrawableSize, validateClipRect(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{ 0.0, 480.0 }));
+}
+
+test "surface converts logical clips to physical Metal scissors" {
+    const full = try physicalScissorRect(
+        .{ .x = 0, .y = 0, .width = 960, .height = 600 },
+        2.0,
+        .{ .width = 1920.0, .height = 1200.0 },
+    );
+    try std.testing.expectEqual(@as(usize, 0), full.x);
+    try std.testing.expectEqual(@as(usize, 0), full.y);
+    try std.testing.expectEqual(@as(usize, 1920), full.width);
+    try std.testing.expectEqual(@as(usize, 1200), full.height);
+
+    const partial = try physicalScissorRect(
+        .{ .x = 3, .y = 5, .width = 7, .height = 11 },
+        1.5,
+        .{ .width = 128.0, .height = 128.0 },
+    );
+    try std.testing.expectEqual(@as(usize, 4), partial.x);
+    try std.testing.expectEqual(@as(usize, 7), partial.y);
+    try std.testing.expectEqual(@as(usize, 11), partial.width);
+    try std.testing.expectEqual(@as(usize, 17), partial.height);
+
+    try std.testing.expectError(Error.InvalidScale, physicalScissorRect(
+        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        0.0,
+        .{ .width = 2.0, .height = 2.0 },
+    ));
+    try std.testing.expectError(Error.InvalidClipRect, physicalScissorRect(
+        .{ .x = 960, .y = 0, .width = 1, .height = 1 },
+        2.0,
+        .{ .width = 1920.0, .height = 1200.0 },
+    ));
+    try std.testing.expectError(Error.InvalidClipRect, physicalScissorRect(
+        .{ .x = 1, .y = 0, .width = 1, .height = 1 },
+        1.0e20,
+        .{ .width = 1.0e30, .height = 1.0e30 },
+    ));
 }
 
 test "surface frame buffer capacity matches the scene contract" {
-    try std.testing.expectEqual(@as(usize, render.max_quads), frame_quad_cap);
-    try std.testing.expectEqual(@sizeOf(render.FrameData), frame_buf_len);
-    try std.testing.expectEqual(@sizeOf(render.TextFrameData), text_frame_buf_len);
-    try std.testing.expectEqual(@as(usize, max_frames_in_flight * 2 + 1), residency_allocation_cap);
+    try std.testing.expectEqual(@as(usize, scene.max_quads), frame_quad_cap);
+    try std.testing.expectEqual(@sizeOf(scene.FrameData), frame_buf_len);
+    try std.testing.expectEqual(@sizeOf(scene.TextFrameData), text_frame_buf_len);
+    try std.testing.expectEqual(@sizeOf(scene.MaskFrameData), mask_frame_buf_len);
+    try std.testing.expectEqual(@as(usize, max_frames_in_flight * 3 + text.max_font_slots + 1), residency_allocation_cap);
+}
+
+test "surface draw commands preserve layer and frame order" {
+    var commands = [_]scene.DrawCommand{
+        .{ .vertex_start = 0, .vertex_count = 6, .clip_index = 0, .layer = scene.layer_content, .order = 2, .kind = .mask },
+        .{ .vertex_start = 0, .vertex_count = 6, .clip_index = 0, .layer = scene.layer_content, .order = 1, .kind = .text },
+        .{ .vertex_start = 0, .vertex_count = 6, .clip_index = 0, .layer = scene.layer_foreground, .order = 0, .kind = .quad },
+        .{ .vertex_start = 0, .vertex_count = 6, .clip_index = 0, .layer = scene.layer_content, .order = 0, .kind = .quad },
+    };
+
+    std.mem.sort(scene.DrawCommand, commands[0..], {}, drawCommandLessThan);
+
+    try std.testing.expectEqual(scene.layer_content, commands[0].layer);
+    try std.testing.expectEqual(@as(u32, 0), commands[0].order);
+    try std.testing.expectEqual(scene.DrawKind.quad, commands[0].kind);
+    try std.testing.expectEqual(@as(u32, 1), commands[1].order);
+    try std.testing.expectEqual(scene.DrawKind.text, commands[1].kind);
+    try std.testing.expectEqual(@as(u32, 2), commands[2].order);
+    try std.testing.expectEqual(scene.DrawKind.mask, commands[2].kind);
+    try std.testing.expectEqual(scene.layer_foreground, commands[3].layer);
+}
+
+test "surface stores app font choice without heap-owned strings" {
+    const family = try storeFontFamily("JetBrains Mono Nerd Font");
+    try std.testing.expectEqualStrings("JetBrains Mono Nerd Font", family[0.."JetBrains Mono Nerd Font".len]);
+    try std.testing.expectEqual(@as(u8, 0), family["JetBrains Mono Nerd Font".len]);
+    try std.testing.expectError(Error.InvalidFontOptions, storeFontFamily(""));
+
+    const variations = try storeFontVariations(&.{.{ .tag = text.axis("wght"), .value = 500.0 }});
+    try std.testing.expectEqual(text.axis("wght"), variations[0].tag);
+    try std.testing.expectEqual(@as(f32, 500.0), variations[0].value);
+    try std.testing.expect(fontVariationsEqual(
+        variations[0..1],
+        &.{.{ .tag = text.axis("wght"), .value = 500.0 }},
+    ));
 }
