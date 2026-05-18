@@ -14,15 +14,15 @@ struct ZPUIQuad {
     float4 border_color;
     float4 radius;
     float border_width;
-    float reserved0;
-    float reserved1;
-    float reserved2;
+    float padding0;
+    float padding1;
+    float padding2;
 };
 
 struct ZPUIFrameData {
-    float2 drawable_size;
+    float2 frame_size_points;
     uint quad_count;
-    uint reserved;
+    float scale;
     ZPUIQuad quads[2048];
 };
 
@@ -38,9 +38,9 @@ struct ZPUIGlyph {
     ZPUIAtlasRect atlas_rect;
     float4 color;
     uint atlas_page;
-    uint reserved0;
-    uint reserved1;
-    uint reserved2;
+    uint padding0;
+    uint padding1;
+    uint padding2;
 };
 
 struct ZPUIMask {
@@ -50,16 +50,16 @@ struct ZPUIMask {
 };
 
 struct ZPUITextFrameData {
-    float2 drawable_size;
+    float2 frame_size_points;
     uint glyph_count;
-    uint reserved;
+    float scale;
     ZPUIGlyph glyphs[16384];
 };
 
 struct ZPUIMaskFrameData {
-    float2 drawable_size;
+    float2 frame_size_points;
     uint mask_count;
-    uint reserved;
+    float scale;
     ZPUIMask masks[1024];
 };
 
@@ -74,7 +74,7 @@ static_assert(sizeof(ZPUIMaskFrameData) == 49168, "ZPUIMaskFrameData ABI size mi
 
 struct ZPUIVertexOut {
     float4 position [[position]];
-    float2 pixel;
+    float2 point;
     uint quad_index [[flat]];
 };
 
@@ -100,10 +100,10 @@ constant float2 zpui_quad_corners[6] = {
     float2(1.0, 1.0),
 };
 
-static float4 zpui_pixel_position(float2 pixel, float2 drawable_size) {
+static float4 zpui_point_position(float2 point, float2 frame_size_points) {
     const float2 clip = float2(
-        pixel.x / drawable_size.x * 2.0 - 1.0,
-        1.0 - pixel.y / drawable_size.y * 2.0
+        point.x / frame_size_points.x * 2.0 - 1.0,
+        1.0 - point.y / frame_size_points.y * 2.0
     );
     return float4(clip, 0.0, 1.0);
 }
@@ -134,20 +134,25 @@ static float zpui_rounded_rect_sdf(float2 local, float2 size, float4 radius) {
     return length(max(q, float2(0.0))) + min(max(q.x, q.y), 0.0) - corner_radius;
 }
 
+static float zpui_edge_coverage(float distance, float scale) {
+    const float aa_width_points = 1.0 / max(scale, 1.0);
+    return saturate(0.5 - distance / aa_width_points);
+}
+
 vertex ZPUIVertexOut zpui_vertex(uint vertex_id [[vertex_id]],
                                  constant ZPUIFrameData &frame [[buffer(0)]]) {
     const uint quad_index = vertex_id / 6;
     const uint corner_index = vertex_id - quad_index * 6;
     const ZPUIQuad quad = frame.quads[quad_index];
     const float2 corner = zpui_quad_corners[corner_index];
-    const float2 pixel = float2(
+    const float2 point = float2(
         quad.rect.x + quad.rect.width * corner.x,
         quad.rect.y + quad.rect.height * corner.y
     );
 
     ZPUIVertexOut out;
-    out.position = zpui_pixel_position(pixel, frame.drawable_size);
-    out.pixel = pixel;
+    out.position = zpui_point_position(point, frame.frame_size_points);
+    out.point = point;
     out.quad_index = quad_index;
     return out;
 }
@@ -156,14 +161,14 @@ fragment float4 zpui_fragment(ZPUIVertexOut in [[stage_in]],
                               constant ZPUIFrameData &frame [[buffer(0)]]) {
     const ZPUIQuad quad = frame.quads[in.quad_index];
     const float2 size = float2(quad.rect.width, quad.rect.height);
-    const float2 local = in.pixel - float2(quad.rect.x, quad.rect.y);
+    const float2 local = in.point - float2(quad.rect.x, quad.rect.y);
 
     if (quad.border_width == 0.0 && zpui_zero_radius(quad.radius)) {
         return zpui_premultiply(quad.fill_color);
     }
 
     const float outer_distance = zpui_rounded_rect_sdf(local, size, quad.radius);
-    const float outer_alpha = saturate(0.5 - outer_distance);
+    const float outer_alpha = zpui_edge_coverage(outer_distance, frame.scale);
     if (outer_alpha <= 0.0) {
         return float4(0.0);
     }
@@ -179,7 +184,7 @@ fragment float4 zpui_fragment(ZPUIVertexOut in [[stage_in]],
         const float2 inner_local = local - float2(border_width);
         const float4 inner_radius = max(quad.radius - float4(border_width), float4(0.0));
         const float inner_distance = zpui_rounded_rect_sdf(inner_local, inner_size, inner_radius);
-        inner_alpha = saturate(0.5 - inner_distance);
+        inner_alpha = zpui_edge_coverage(inner_distance, frame.scale);
     }
 
     const float4 color = mix(quad.border_color, quad.fill_color, inner_alpha);
@@ -192,13 +197,13 @@ vertex ZPUITextVertexOut zpui_text_vertex(uint vertex_id [[vertex_id]],
     const uint corner_index = vertex_id - glyph_index * 6;
     const ZPUIGlyph glyph = frame.glyphs[glyph_index];
     const float2 corner = zpui_quad_corners[corner_index];
-    const float2 pixel = float2(
+    const float2 point = float2(
         glyph.rect.x + glyph.rect.width * corner.x,
         glyph.rect.y + glyph.rect.height * corner.y
     );
 
     ZPUITextVertexOut out;
-    out.position = zpui_pixel_position(pixel, frame.drawable_size);
+    out.position = zpui_point_position(point, frame.frame_size_points);
     out.uv = float2(
         glyph.atlas_rect.x + glyph.atlas_rect.width * corner.x,
         glyph.atlas_rect.y + glyph.atlas_rect.height * corner.y
@@ -239,13 +244,13 @@ vertex ZPUIMaskVertexOut zpui_mask_vertex(uint vertex_id [[vertex_id]],
     const uint corner_index = vertex_id - mask_index * 6;
     const ZPUIMask mask = frame.masks[mask_index];
     const float2 corner = zpui_quad_corners[corner_index];
-    const float2 pixel = float2(
+    const float2 point = float2(
         mask.rect.x + mask.rect.width * corner.x,
         mask.rect.y + mask.rect.height * corner.y
     );
 
     ZPUIMaskVertexOut out;
-    out.position = zpui_pixel_position(pixel, frame.drawable_size);
+    out.position = zpui_point_position(point, frame.frame_size_points);
     out.uv = float2(
         mask.atlas_rect.x + mask.atlas_rect.width * corner.x,
         mask.atlas_rect.y + mask.atlas_rect.height * corner.y

@@ -91,7 +91,7 @@ pub const InputSnapshot = struct {
 };
 
 pub const Begin = struct {
-    size: [2]f32,
+    frame_size_points: [2]f32,
     scale: f32 = 1.0,
     clear_color: scene.ClearColor = .{ 0.0, 0.0, 0.0, 1.0 },
     input: InputSnapshot = .{},
@@ -150,7 +150,7 @@ pub const Storage = struct {
 
 pub const Frame = struct {
     storage: *Storage,
-    size: [2]f32,
+    frame_size_points: [2]f32,
     scale: f32,
     input: InputSnapshot,
     font: ?*const text.Font,
@@ -166,12 +166,12 @@ pub const Frame = struct {
     pub fn begin(storage: *Storage, options: Begin) Frame {
         return .{
             .storage = storage,
-            .size = options.size,
+            .frame_size_points = options.frame_size_points,
             .scale = options.scale,
             .input = options.input,
             .font = options.font,
             .fonts = options.fonts,
-            .scene = scene.SceneBuilder.begin(&storage.scene, options.size, options.clear_color),
+            .scene = scene.SceneBuilder.begin(&storage.scene, options.frame_size_points, options.clear_color),
             .hit_count = 0,
             .glyph_count = 0,
             .text_batch_count = 0,
@@ -182,16 +182,12 @@ pub const Frame = struct {
     }
 
     pub fn root(frame: *const Frame) ui.layout.Rect {
-        return ui.layout.Rect.init(0.0, 0.0, frame.size[0], frame.size[1]);
-    }
-
-    pub fn drawableClip(frame: *Frame) Error!u32 {
-        return frame.pushDrawableClip();
+        return ui.layout.Rect.init(0.0, 0.0, frame.frame_size_points[0], frame.frame_size_points[1]);
     }
 
     pub fn clip(frame: *Frame, rect: ui.layout.Rect) Error!u32 {
         const clipped = rect.intersect(frame.root());
-        return frame.pushClip(try renderClip(clipped));
+        return frame.pushClip(try clipRectFromPoints(clipped));
     }
 
     pub fn clipRect(frame: *const Frame, clip_index: u32) Error!ui.layout.Rect {
@@ -221,8 +217,8 @@ pub const Frame = struct {
         };
     }
 
-    pub fn pushDrawableClip(frame: *Frame) Error!u32 {
-        return frame.scene.pushDrawableClip();
+    pub fn pushFrameClip(frame: *Frame) Error!u32 {
+        return frame.scene.pushFrameClip();
     }
 
     pub fn pushClip(frame: *Frame, clip_rect: scene.ClipRect) Error!u32 {
@@ -242,7 +238,7 @@ pub const Frame = struct {
     }
 
     pub fn pushFill(frame: *Frame, rect: ui.layout.Rect, color: ui.style.Color, clip_index: u32) Error!void {
-        try frame.pushQuad(renderRect(rect), renderColor(color), clip_index);
+        try frame.pushQuad(sceneRectFromPoints(rect), renderColor(color), clip_index);
     }
 
     pub fn pushFillLayer(frame: *Frame, rect: ui.layout.Rect, color: ui.style.Color, clip_index: u32, layer: u32) Error!void {
@@ -252,7 +248,7 @@ pub const Frame = struct {
     }
 
     pub fn pushStyledRect(frame: *Frame, rect: ui.layout.Rect, style: ui.style.Style, clip_index: u32) Error!void {
-        try frame.scene.pushStyledQuad(renderRect(rect), renderQuadStyle(style), clip_index);
+        try frame.scene.pushStyledQuad(sceneRectFromPoints(rect), renderQuadStyle(style), clip_index);
     }
 
     pub fn pushStyledRectLayer(frame: *Frame, rect: ui.layout.Rect, style: ui.style.Style, clip_index: u32, layer: u32) Error!void {
@@ -532,7 +528,7 @@ pub const Frame = struct {
     }
 };
 
-fn renderRect(rect: ui.layout.Rect) scene.Rect {
+fn sceneRectFromPoints(rect: ui.layout.Rect) scene.Rect {
     return .{
         .x = rect.x,
         .y = rect.y,
@@ -541,9 +537,11 @@ fn renderRect(rect: ui.layout.Rect) scene.Rect {
     };
 }
 
-fn renderClip(rect: ui.layout.Rect) scene.SceneBuildError!scene.ClipRect {
+fn clipRectFromPoints(rect: ui.layout.Rect) scene.SceneBuildError!scene.ClipRect {
     if (!validRect(rect)) return scene.SceneBuildError.InvalidClip;
 
+    // Clip max edges are exclusive. Round out in point space so fractional
+    // layout never loses visible coverage before the physical scissor clamp.
     const x0 = @floor(rect.x);
     const y0 = @floor(rect.y);
     const x1 = @ceil(rect.x + rect.width);
@@ -615,12 +613,12 @@ fn clipCoord(value: f32) scene.SceneBuildError!u32 {
 test "frame owns caller-provided scene storage for one scene" {
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{
-        .size = .{ 640.0, 480.0 },
+        .frame_size_points = .{ 640.0, 480.0 },
         .scale = 2.0,
         .input = .{ .cursor = .{ 12.0, 18.0 }, .buttons = 1 },
     });
 
-    const clip = try frame.pushDrawableClip();
+    const clip = try frame.pushFrameClip();
     try frame.beginBatch(clip);
     try frame.pushQuad(.{
         .x = 8.0,
@@ -630,7 +628,7 @@ test "frame owns caller-provided scene storage for one scene" {
     }, .{ 1.0, 1.0, 1.0, 1.0 }, clip);
     const out = try frame.finish();
 
-    try std.testing.expectEqual([2]f32{ 640.0, 480.0 }, frame.size);
+    try std.testing.expectEqual([2]f32{ 640.0, 480.0 }, frame.frame_size_points);
     try std.testing.expectEqual(@as(f32, 2.0), frame.scale);
     try std.testing.expectEqual(@as(?[2]f32, .{ 12.0, 18.0 }), frame.input.cursor);
     try std.testing.expectEqual(@as(usize, 1), out.clips.len);
@@ -651,8 +649,8 @@ test "input events stay plain frame data" {
 
 test "frame preserves scene builder errors" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 320.0, 200.0 } });
-    const clip = try frame.pushDrawableClip();
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 320.0, 200.0 } });
+    const clip = try frame.pushFrameClip();
 
     try std.testing.expectError(Error.NoOpenBatch, frame.pushQuad(.{
         .x = 0.0,
@@ -664,7 +662,7 @@ test "frame preserves scene builder errors" {
 
 test "frame owns layout scratch and reports capacity errors" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 64.0, 64.0 } });
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 64.0, 64.0 } });
     const items = [_]ui.layout.LayoutItem{
         ui.layout.LayoutItem.fixed(ui.layout.Size.init(12.0, 8.0)),
         ui.layout.LayoutItem.fixed(ui.layout.Size.init(10.0, 8.0)),
@@ -688,7 +686,7 @@ test "frame owns layout scratch and reports capacity errors" {
 
 test "frame direct API cuts roots clips and coalesces adjacent rects" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 80.0 } });
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 80.0 } });
 
     const root = frame.root();
     const clip = try frame.clip(root);
@@ -716,7 +714,7 @@ test "frame resolves hot id through frame-owned hit stream" {
     storage.hit_state = .{ .hot = 99, .active = 7, .focus = 8 };
 
     var frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 100.0 },
+        .frame_size_points = .{ 100.0, 100.0 },
         .input = .{ .cursor = .{ 16.0, 16.0 } },
     });
 
@@ -728,7 +726,7 @@ test "frame resolves hot id through frame-owned hit stream" {
     try std.testing.expectEqual(@as(ui.hit.HitId, 7), frame.hitState().active);
     try std.testing.expectEqual(@as(ui.hit.HitId, 8), frame.hitState().focus);
 
-    var next = Frame.begin(&storage, .{ .size = .{ 100.0, 100.0 } });
+    var next = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
     try std.testing.expectEqual(ui.hit.none, next.resolveHot());
     try std.testing.expectEqual(@as(ui.hit.HitId, 7), next.hitState().active);
     try std.testing.expectEqual(@as(ui.hit.HitId, 8), next.hitState().focus);
@@ -736,7 +734,7 @@ test "frame resolves hot id through frame-owned hit stream" {
 
 test "frame rejects hit stream overflow" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 100.0 } });
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
     const item = ui.hit.HitItem.init(1, ui.layout.Rect.init(0.0, 0.0, 1.0, 1.0));
 
     for (0..scene.max_quads) |_| {
@@ -747,8 +745,8 @@ test "frame rejects hit stream overflow" {
 
 test "frame push fill converts style color into scene quads" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 64.0, 64.0 } });
-    const clip = try frame.pushDrawableClip();
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 64.0, 64.0 } });
+    const clip = try frame.pushFrameClip();
 
     try frame.beginBatch(clip);
     try frame.pushFill(
@@ -766,8 +764,8 @@ test "frame push fill converts style color into scene quads" {
 
 test "frame push styled rect resolves style into render quad data" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 64.0, 64.0 } });
-    const clip = try frame.pushDrawableClip();
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 64.0, 64.0 } });
+    const clip = try frame.pushFrameClip();
 
     try frame.pushStyledRectLayer(
         ui.layout.Rect.init(3.0, 4.0, 12.0, 14.0),
@@ -801,11 +799,11 @@ test "frame pushes text into a caller-owned glyph stream" {
 
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 100.0 },
+        .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,
     });
 
-    const clip = try frame.pushDrawableClip();
+    const clip = try frame.pushFrameClip();
     const measured = try frame.measureText("zz");
     const result = try frame.pushText(ui.layout.Point.init(12.0, 18.0), "zz", ui.style.Color.rgb(0.8, 0.8, 0.8), clip);
     const out = try frame.finish();
@@ -823,7 +821,7 @@ test "frame pushes text into a caller-owned glyph stream" {
     try std.testing.expectEqual(ui.layout.Rect.init(18.0, 18.0, 5.0, 7.0), out.glyphs[1].rect);
 
     var invalid_clip_frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 100.0 },
+        .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,
     });
     try std.testing.expectError(scene.SceneBuildError.InvalidClipIndex, invalid_clip_frame.pushText(.{}, "z", .{}, 0));
@@ -841,7 +839,7 @@ test "frame direct API preserves order when text splits rect batches" {
 
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 80.0 },
+        .frame_size_points = .{ 100.0, 80.0 },
         .font = &font,
     });
     const clip = try frame.clip(frame.root());
@@ -861,7 +859,7 @@ test "frame direct API preserves order when text splits rect batches" {
 
 test "frame pushes shaped text lines without font lookup" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 80.0 } });
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 80.0 } });
     const clip = try frame.clip(frame.root());
     var line_storage: text.TextLineStorage = undefined;
     line_storage.glyphs[0] = .{
@@ -892,7 +890,7 @@ test "frame pushes shaped text lines without font lookup" {
 
 test "frame paints cached text layouts with current run colors" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 80.0 } });
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 80.0 } });
     const clip = try frame.clip(frame.root());
     var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_content });
 
@@ -954,10 +952,10 @@ test "frame text runs emit one batch with per glyph colors" {
 
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 100.0 },
+        .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,
     });
-    const clip = try frame.pushDrawableClip();
+    const clip = try frame.pushFrameClip();
     const runs = [_]text.AsciiRun{
         .{ .bytes = "a", .color = ui.style.Color.rgb(1.0, 0.0, 0.0) },
         .{ .bytes = "b", .color = ui.style.Color.rgb(0.0, 1.0, 0.0) },
@@ -994,11 +992,11 @@ test "frame text runs can select fixed font slots" {
 
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 100.0 },
+        .frame_size_points = .{ 100.0, 100.0 },
         .font = &fonts[0],
         .fonts = fonts[0..],
     });
-    const clip = try frame.pushDrawableClip();
+    const clip = try frame.pushFrameClip();
     const runs = [_]text.AsciiRun{
         .{ .bytes = "a", .color = ui.style.Color.rgb(1.0, 1.0, 1.0), .font_slot = 0 },
         .{ .bytes = "b", .color = ui.style.Color.rgb(0.8, 0.8, 0.8), .font_slot = 1 },
@@ -1031,7 +1029,7 @@ test "frame exposes logical text placement and physical pixel snapping" {
 
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 100.0 },
+        .frame_size_points = .{ 100.0, 100.0 },
         .scale = 2.0,
         .font = &font,
     });
@@ -1056,10 +1054,10 @@ test "frame exposes layer helpers for editor composition" {
     };
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 100.0 },
+        .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,
     });
-    const clip = try frame.pushDrawableClip();
+    const clip = try frame.pushFrameClip();
 
     try frame.pushFillLayer(ui.layout.Rect.init(0.0, 0.0, 10.0, 10.0), .{}, clip, scene.layer_foreground);
     _ = try frame.pushTextLayer(.{}, "z", .{}, clip, scene.layer_overlay);
@@ -1073,8 +1071,8 @@ test "frame exposes layer helpers for editor composition" {
 
 test "frame pushes masks into a caller-owned mask stream" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 100.0 } });
-    const clip = try frame.pushDrawableClip();
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
+    const clip = try frame.pushFrameClip();
 
     const first_mask = mask.rectFromPixels(1, 1, 16, 16);
     const second_mask = mask.rectFromPixels(19, 1, 16, 16);
@@ -1101,10 +1099,10 @@ test "frame does not merge masks across intervening draw commands" {
 
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 100.0 },
+        .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,
     });
-    const clip = try frame.pushDrawableClip();
+    const clip = try frame.pushFrameClip();
     const atlas_rect = mask.rectFromPixels(1, 1, 16, 16);
 
     try frame.pushMask(ui.layout.Rect.init(0.0, 0.0, 16.0, 16.0), atlas_rect, .{}, clip, scene.layer_content);
@@ -1120,8 +1118,8 @@ test "frame does not merge masks across intervening draw commands" {
 
 test "frame rejects mask stream overflow explicitly" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 100.0 } });
-    const clip = try frame.pushDrawableClip();
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
+    const clip = try frame.pushFrameClip();
     const atlas_rect = mask.rectFromPixels(1, 1, 1, 1);
 
     for (0..scene.max_masks) |i| {
@@ -1138,7 +1136,7 @@ test "frame rejects mask stream overflow explicitly" {
 
 test "frame push text requires an explicit font" {
     var storage: Storage = .{};
-    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 100.0 } });
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
 
     try std.testing.expectError(text.Error.NoFont, frame.measureText("z"));
     try std.testing.expectError(text.Error.NoFont, frame.pushText(.{}, "z", .{}, 0));
@@ -1156,10 +1154,10 @@ test "frame rejects text batch overflow" {
 
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{
-        .size = .{ 100.0, 100.0 },
+        .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,
     });
-    const clip = try frame.pushDrawableClip();
+    const clip = try frame.pushFrameClip();
 
     for (0..scene.max_text_batches) |_| {
         _ = try frame.pushText(.{}, "z", .{}, clip);

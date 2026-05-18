@@ -115,7 +115,7 @@ pub const DrawCommand = extern struct {
 
 pub const Scene = struct {
     clear_color: ClearColor,
-    drawable_size: [2]f32,
+    frame_size_points: [2]f32,
     quads: []const Quad,
     batches: []const Batch,
     clips: []const ClipRect,
@@ -132,24 +132,28 @@ pub const SceneStorage = struct {
     clips: [max_clips]ClipRect = undefined,
 };
 
+// GPU frame buffers share a 16-byte header: frame size in logical points,
+// stream item count, then backing scale. The quad shader uses scale for SDF
+// antialiasing today; text and mask keep the same header so every stream is
+// compiled from one surface-owned coordinate contract.
 pub const FrameData = extern struct {
-    drawable_size: [2]f32,
+    frame_size_points: [2]f32,
     quad_count: u32,
-    reserved: u32 = 0,
+    scale: f32 = 1.0,
     quads: [max_quads]GpuQuad,
 };
 
 pub const TextFrameData = extern struct {
-    drawable_size: [2]f32,
+    frame_size_points: [2]f32,
     glyph_count: u32,
-    reserved: u32 = 0,
+    scale: f32 = 1.0,
     glyphs: [text.max_frame_glyphs]text.GlyphInstance,
 };
 
 pub const MaskFrameData = extern struct {
-    drawable_size: [2]f32,
+    frame_size_points: [2]f32,
     mask_count: u32,
-    reserved: u32 = 0,
+    scale: f32 = 1.0,
     masks: [max_masks]mask.Instance,
 };
 
@@ -168,14 +172,17 @@ comptime {
     std.debug.assert(@sizeOf(TextFrameData) == textFrameDataByteLen(text.max_frame_glyphs));
     std.debug.assert(@sizeOf(MaskFrameData) == maskFrameDataByteLen(max_masks));
     std.debug.assert(text.max_atlas_pages == 4);
-    std.debug.assert(@offsetOf(FrameData, "drawable_size") == 0);
+    std.debug.assert(@offsetOf(FrameData, "frame_size_points") == 0);
     std.debug.assert(@offsetOf(FrameData, "quad_count") == 8);
+    std.debug.assert(@offsetOf(FrameData, "scale") == 12);
     std.debug.assert(@offsetOf(FrameData, "quads") == 16);
-    std.debug.assert(@offsetOf(TextFrameData, "drawable_size") == 0);
+    std.debug.assert(@offsetOf(TextFrameData, "frame_size_points") == 0);
     std.debug.assert(@offsetOf(TextFrameData, "glyph_count") == 8);
+    std.debug.assert(@offsetOf(TextFrameData, "scale") == 12);
     std.debug.assert(@offsetOf(TextFrameData, "glyphs") == 16);
-    std.debug.assert(@offsetOf(MaskFrameData, "drawable_size") == 0);
+    std.debug.assert(@offsetOf(MaskFrameData, "frame_size_points") == 0);
     std.debug.assert(@offsetOf(MaskFrameData, "mask_count") == 8);
+    std.debug.assert(@offsetOf(MaskFrameData, "scale") == 12);
     std.debug.assert(@offsetOf(MaskFrameData, "masks") == 16);
 }
 
@@ -198,6 +205,7 @@ pub const CompileError = error{
     QuadCapacityExceeded,
     BatchCapacityExceeded,
     ClipCapacityExceeded,
+    InvalidScale,
     GlyphCapacityExceeded,
     InvalidGlyph,
     TextBatchCapacityExceeded,
@@ -229,7 +237,7 @@ pub const MaskCompileResult = struct {
 
 pub const SceneBuilder = struct {
     storage: *SceneStorage,
-    drawable_size: [2]f32,
+    frame_size_points: [2]f32,
     clear_color: ClearColor,
     quad_count: u32 = 0,
     batch_count: u32 = 0,
@@ -239,16 +247,16 @@ pub const SceneBuilder = struct {
     open_batch_layer: u32 = layer_background,
     batch_open: bool = false,
 
-    pub fn begin(storage: *SceneStorage, drawable_size: [2]f32, clear_color: ClearColor) SceneBuilder {
+    pub fn begin(storage: *SceneStorage, frame_size_points: [2]f32, clear_color: ClearColor) SceneBuilder {
         return .{
             .storage = storage,
-            .drawable_size = drawable_size,
+            .frame_size_points = frame_size_points,
             .clear_color = clear_color,
         };
     }
 
-    pub fn pushDrawableClip(builder: *SceneBuilder) SceneBuildError!u32 {
-        return builder.pushClip(drawableClip(builder.drawable_size));
+    pub fn pushFrameClip(builder: *SceneBuilder) SceneBuildError!u32 {
+        return builder.pushClip(frameClip(builder.frame_size_points));
     }
 
     pub fn pushClip(builder: *SceneBuilder, clip: ClipRect) SceneBuildError!u32 {
@@ -322,7 +330,7 @@ pub const SceneBuilder = struct {
         const clip_count: usize = @intCast(builder.clip_count);
         return .{
             .clear_color = builder.clear_color,
-            .drawable_size = builder.drawable_size,
+            .frame_size_points = builder.frame_size_points,
             .quads = builder.storage.quads[0..quad_count],
             .batches = builder.storage.batches[0..batch_count],
             .clips = builder.storage.clips[0..clip_count],
@@ -335,7 +343,8 @@ pub const SceneBuilder = struct {
     }
 };
 
-pub fn compileScene(scene: *const Scene, frame_data: *FrameData) CompileError!CompileResult {
+pub fn compileScene(scene: *const Scene, frame_data: *FrameData, scale: f32) CompileError!CompileResult {
+    if (!validScale(scale)) return CompileError.InvalidScale;
     if (scene.quads.len > max_quads) return CompileError.QuadCapacityExceeded;
     if (scene.batches.len > max_batches) return CompileError.BatchCapacityExceeded;
     if (scene.clips.len > max_clips) return CompileError.ClipCapacityExceeded;
@@ -365,9 +374,9 @@ pub fn compileScene(scene: *const Scene, frame_data: *FrameData) CompileError!Co
     }
     if (next_vertex_start != max_vertex_count) return CompileError.InvalidBatch;
 
-    frame_data.drawable_size = scene.drawable_size;
+    frame_data.frame_size_points = scene.frame_size_points;
     frame_data.quad_count = @intCast(scene.quads.len);
-    frame_data.reserved = 0;
+    frame_data.scale = scale;
     for (scene.quads, 0..) |quad, i| {
         frame_data.quads[i] = .{
             .rect = quad.rect,
@@ -385,13 +394,14 @@ pub fn compileScene(scene: *const Scene, frame_data: *FrameData) CompileError!Co
     };
 }
 
-pub fn compileText(scene: *const Scene, frame_data: *TextFrameData) CompileError!TextCompileResult {
+pub fn compileText(scene: *const Scene, frame_data: *TextFrameData, scale: f32) CompileError!TextCompileResult {
+    if (!validScale(scale)) return CompileError.InvalidScale;
     if (scene.glyphs.len > text.max_frame_glyphs) return CompileError.GlyphCapacityExceeded;
     if (scene.text_batches.len > max_text_batches) return CompileError.TextBatchCapacityExceeded;
 
-    frame_data.drawable_size = scene.drawable_size;
+    frame_data.frame_size_points = scene.frame_size_points;
     frame_data.glyph_count = @intCast(scene.glyphs.len);
-    frame_data.reserved = 0;
+    frame_data.scale = scale;
     for (scene.glyphs, 0..) |glyph, i| {
         if (!validGlyph(glyph)) return CompileError.InvalidGlyph;
         frame_data.glyphs[i] = glyph;
@@ -419,13 +429,14 @@ pub fn compileText(scene: *const Scene, frame_data: *TextFrameData) CompileError
     };
 }
 
-pub fn compileMasks(scene: *const Scene, frame_data: *MaskFrameData) CompileError!MaskCompileResult {
+pub fn compileMasks(scene: *const Scene, frame_data: *MaskFrameData, scale: f32) CompileError!MaskCompileResult {
+    if (!validScale(scale)) return CompileError.InvalidScale;
     if (scene.masks.len > max_masks) return CompileError.MaskCapacityExceeded;
     if (scene.mask_batches.len > max_mask_batches) return CompileError.MaskBatchCapacityExceeded;
 
-    frame_data.drawable_size = scene.drawable_size;
+    frame_data.frame_size_points = scene.frame_size_points;
     frame_data.mask_count = @intCast(scene.masks.len);
-    frame_data.reserved = 0;
+    frame_data.scale = scale;
     for (scene.masks, 0..) |instance, i| {
         if (!validMask(instance)) return CompileError.InvalidMask;
         frame_data.masks[i] = instance;
@@ -465,24 +476,24 @@ pub fn maskFrameDataByteLen(mask_count: u32) usize {
     return @offsetOf(MaskFrameData, "masks") + @as(usize, @intCast(mask_count)) * @sizeOf(mask.Instance);
 }
 
-fn drawableClip(drawable_size: [2]f32) ClipRect {
+fn frameClip(frame_size_points: [2]f32) ClipRect {
     return .{
         .x = 0,
         .y = 0,
-        .width = positiveU32(drawable_size[0]),
-        .height = positiveU32(drawable_size[1]),
+        .width = pointExtent(frame_size_points[0]),
+        .height = pointExtent(frame_size_points[1]),
     };
 }
 
-fn positiveU32(value: f32) u32 {
+fn pointExtent(value: f32) u32 {
     if (value <= 0.0 or !std.math.isFinite(value)) return 0;
-    return floorU32(value);
-}
-
-fn floorU32(value: f32) u32 {
     const max_exact_u32_f32: f32 = 4_294_967_040.0;
     if (value >= max_exact_u32_f32) return std.math.maxInt(u32);
-    return @intFromFloat(@floor(value));
+    return @intFromFloat(@ceil(value));
+}
+
+fn validScale(scale: f32) bool {
+    return scale > 0.0 and std.math.isFinite(scale);
 }
 
 fn validRect(rect: Rect) bool {
@@ -575,32 +586,57 @@ test "scene and GPU frame layouts stay stable" {
     try std.testing.expectEqual(textFrameDataByteLen(text.max_frame_glyphs), @sizeOf(TextFrameData));
     try std.testing.expectEqual(maskFrameDataByteLen(max_masks), @sizeOf(MaskFrameData));
 
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(FrameData, "drawable_size"));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(FrameData, "frame_size_points"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(FrameData, "quad_count"));
+    try std.testing.expectEqual(@as(usize, 12), @offsetOf(FrameData, "scale"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(FrameData, "quads"));
     try std.testing.expectEqual(@as(usize, 16), frameDataByteLen(0));
     try std.testing.expectEqual(@as(usize, 96), frameDataByteLen(1));
     try std.testing.expectEqual(@sizeOf(FrameData), frameDataByteLen(max_quads));
 
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(TextFrameData, "drawable_size"));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(TextFrameData, "frame_size_points"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(TextFrameData, "glyph_count"));
+    try std.testing.expectEqual(@as(usize, 12), @offsetOf(TextFrameData, "scale"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(TextFrameData, "glyphs"));
     try std.testing.expectEqual(@as(usize, 16), textFrameDataByteLen(0));
     try std.testing.expectEqual(@as(usize, 80), textFrameDataByteLen(1));
     try std.testing.expectEqual(@sizeOf(TextFrameData), textFrameDataByteLen(text.max_frame_glyphs));
 
-    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MaskFrameData, "drawable_size"));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(MaskFrameData, "frame_size_points"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(MaskFrameData, "mask_count"));
+    try std.testing.expectEqual(@as(usize, 12), @offsetOf(MaskFrameData, "scale"));
     try std.testing.expectEqual(@as(usize, 16), @offsetOf(MaskFrameData, "masks"));
     try std.testing.expectEqual(@as(usize, 16), maskFrameDataByteLen(0));
     try std.testing.expectEqual(@as(usize, 64), maskFrameDataByteLen(1));
     try std.testing.expectEqual(@sizeOf(MaskFrameData), maskFrameDataByteLen(max_masks));
 }
 
+test "scene compilers reject invalid backing scale" {
+    const scene: Scene = .{
+        .clear_color = .{ 0, 0, 0, 1 },
+        .frame_size_points = .{ 640.0, 480.0 },
+        .quads = &.{},
+        .batches = &.{},
+        .clips = &.{},
+        .glyphs = &.{},
+        .text_batches = &.{},
+        .masks = &.{},
+        .mask_batches = &.{},
+        .font = null,
+    };
+    var frame_data: FrameData = undefined;
+    var text_frame_data: TextFrameData = undefined;
+    var mask_frame_data: MaskFrameData = undefined;
+
+    try std.testing.expectError(CompileError.InvalidScale, compileScene(&scene, &frame_data, 0.0));
+    try std.testing.expectError(CompileError.InvalidScale, compileText(&scene, &text_frame_data, std.math.nan(f32)));
+    try std.testing.expectError(CompileError.InvalidScale, compileMasks(&scene, &mask_frame_data, std.math.inf(f32)));
+}
+
 test "scene builder records multiple batches and clips" {
     var storage: SceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 100.0, 50.0 }, .{ 0, 0, 0, 1 });
-    const full_clip = try builder.pushDrawableClip();
+    const full_clip = try builder.pushFrameClip();
     const small_clip = try builder.pushClip(.{ .x = 10, .y = 10, .width = 20, .height = 20 });
 
     try builder.beginBatch(full_clip);
@@ -618,10 +654,21 @@ test "scene builder records multiple batches and clips" {
     try std.testing.expectEqual(@as(u32, 6), scene.batches[1].vertex_start);
 }
 
+test "scene builder frame clip rounds fractional point size outward" {
+    var storage: SceneStorage = undefined;
+    var builder = SceneBuilder.begin(&storage, .{ 666.5, 333.5 }, .{ 0, 0, 0, 1 });
+    const clip = try builder.pushFrameClip();
+    const scene = try builder.finish();
+
+    try std.testing.expectEqual(@as(u32, 0), clip);
+    try std.testing.expectEqual(@as(u32, 667), scene.clips[0].width);
+    try std.testing.expectEqual(@as(u32, 334), scene.clips[0].height);
+}
+
 test "scene batches carry explicit layers and stream order" {
     var storage: SceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 100.0, 50.0 }, .{ 0, 0, 0, 1 });
-    const clip = try builder.pushDrawableClip();
+    const clip = try builder.pushFrameClip();
 
     try builder.beginLayerBatch(clip, layer_foreground);
     try builder.pushQuad(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, .{ 1, 1, 1, 1 }, clip);
@@ -638,7 +685,7 @@ test "scene batches carry explicit layers and stream order" {
 test "scene compiler emits compact GPU frame data" {
     var storage: SceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 100.0, 50.0 }, .{ 0.035, 0.045, 0.06, 1.0 });
-    const clip = try builder.pushDrawableClip();
+    const clip = try builder.pushFrameClip();
     try builder.beginBatch(clip);
     try builder.pushQuad(.{
         .x = 10.0,
@@ -649,12 +696,13 @@ test "scene compiler emits compact GPU frame data" {
     const scene = try builder.finish();
 
     var frame_data: FrameData = undefined;
-    const result = try compileScene(&scene, &frame_data);
+    const result = try compileScene(&scene, &frame_data, 2.0);
 
     try std.testing.expectEqual(@as(u32, 6), result.draw_vertex_count);
     try std.testing.expectEqual(@as(u32, 1), result.quad_count);
     try std.testing.expectEqual(@as(u32, 1), result.batch_count);
-    try std.testing.expectEqual([2]f32{ 100.0, 50.0 }, frame_data.drawable_size);
+    try std.testing.expectEqual([2]f32{ 100.0, 50.0 }, frame_data.frame_size_points);
+    try std.testing.expectEqual(@as(f32, 2.0), frame_data.scale);
     try std.testing.expectEqual(@as(u32, 1), frame_data.quad_count);
     try std.testing.expectEqual(scene.quads[0].rect, frame_data.quads[0].rect);
     try std.testing.expectEqual(scene.quads[0].fill_color, frame_data.quads[0].fill_color);
@@ -666,7 +714,7 @@ test "scene compiler emits compact GPU frame data" {
 test "styled quads carry fill border and radius into GPU data" {
     var storage: SceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 200.0, 100.0 }, .{ 0, 0, 0, 1 });
-    const clip = try builder.pushDrawableClip();
+    const clip = try builder.pushFrameClip();
 
     try builder.beginLayerBatch(clip, layer_surface);
     try builder.pushStyledQuad(.{
@@ -683,7 +731,7 @@ test "styled quads carry fill border and radius into GPU data" {
     const scene = try builder.finish();
 
     var frame_data: FrameData = undefined;
-    _ = try compileScene(&scene, &frame_data);
+    _ = try compileScene(&scene, &frame_data, 1.0);
 
     try std.testing.expectEqual(layer_surface, scene.batches[0].layer);
     try std.testing.expectEqual(Radius{ .top_left = 4.0, .top_right = 5.0, .bottom_right = 6.0, .bottom_left = 7.0 }, frame_data.quads[0].radius);
@@ -700,7 +748,7 @@ test "text compiler emits compact glyph frame data" {
     }};
     var scene: Scene = .{
         .clear_color = .{ 0, 0, 0, 1 },
-        .drawable_size = .{ 640.0, 480.0 },
+        .frame_size_points = .{ 640.0, 480.0 },
         .quads = &.{},
         .batches = &.{},
         .clips = &.{.{ .x = 0, .y = 0, .width = 640, .height = 480 }},
@@ -716,19 +764,20 @@ test "text compiler emits compact glyph frame data" {
     };
 
     var frame_data: TextFrameData = undefined;
-    const result = try compileText(&scene, &frame_data);
+    const result = try compileText(&scene, &frame_data, 2.0);
 
     try std.testing.expectEqual(@as(u32, vertices_per_glyph), result.draw_vertex_count);
     try std.testing.expectEqual(@as(u32, 1), result.glyph_count);
     try std.testing.expectEqual(@as(u32, 1), result.batch_count);
-    try std.testing.expectEqual([2]f32{ 640.0, 480.0 }, frame_data.drawable_size);
+    try std.testing.expectEqual([2]f32{ 640.0, 480.0 }, frame_data.frame_size_points);
+    try std.testing.expectEqual(@as(f32, 2.0), frame_data.scale);
     try std.testing.expectEqual(@as(u32, 1), frame_data.glyph_count);
     try std.testing.expectEqual(glyphs[0], frame_data.glyphs[0]);
     try std.testing.expectEqual(@as(usize, 80), textFrameDataByteLen(result.glyph_count));
 
     scene.glyphs = &.{};
     scene.text_batches = &.{};
-    const empty = try compileText(&scene, &frame_data);
+    const empty = try compileText(&scene, &frame_data, 2.0);
     try std.testing.expectEqual(@as(u32, 0), empty.draw_vertex_count);
     try std.testing.expectEqual(@as(u32, 0), empty.glyph_count);
     try std.testing.expectEqual(@as(u32, 0), empty.batch_count);
@@ -744,7 +793,7 @@ test "text compiler rejects malformed text batches" {
     var batches = [_]TextBatch{.{ .vertex_start = 0, .vertex_count = 0, .clip_index = 0 }};
     var scene: Scene = .{
         .clear_color = .{ 0, 0, 0, 1 },
-        .drawable_size = .{ 640.0, 480.0 },
+        .frame_size_points = .{ 640.0, 480.0 },
         .quads = &.{},
         .batches = &.{},
         .clips = clips[0..],
@@ -756,11 +805,11 @@ test "text compiler rejects malformed text batches" {
     };
 
     var frame_data: TextFrameData = undefined;
-    try std.testing.expectError(CompileError.InvalidTextBatch, compileText(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidTextBatch, compileText(&scene, &frame_data, 1.0));
 
     batches[0].vertex_count = vertices_per_glyph;
     batches[0].clip_index = 1;
-    try std.testing.expectError(CompileError.InvalidClipIndex, compileText(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidClipIndex, compileText(&scene, &frame_data, 1.0));
 }
 
 test "text compiler rejects malformed glyph payloads" {
@@ -772,7 +821,7 @@ test "text compiler rejects malformed glyph payloads" {
     var batches = [_]TextBatch{.{ .vertex_start = 0, .vertex_count = vertices_per_glyph, .clip_index = 0 }};
     var scene: Scene = .{
         .clear_color = .{ 0, 0, 0, 1 },
-        .drawable_size = .{ 640.0, 480.0 },
+        .frame_size_points = .{ 640.0, 480.0 },
         .quads = &.{},
         .batches = &.{},
         .clips = &.{.{ .x = 0, .y = 0, .width = 640, .height = 480 }},
@@ -785,29 +834,29 @@ test "text compiler rejects malformed glyph payloads" {
     var frame_data: TextFrameData = undefined;
 
     glyphs[0].rect.width = -1.0;
-    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data, 1.0));
 
     glyphs[0].rect.width = 1.0;
     glyphs[0].rect.height = 0.0;
-    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data, 1.0));
 
     glyphs[0].rect.height = 1.0;
     glyphs[0].rect.x = std.math.nan(f32);
-    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data, 1.0));
 
     glyphs[0].rect.x = 0.0;
     glyphs[0].atlas_rect.x = 0.9;
     glyphs[0].atlas_rect.width = 0.2;
-    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data, 1.0));
 
     glyphs[0].atlas_rect.x = 0.0;
     glyphs[0].atlas_rect.width = 0.25;
     glyphs[0].color.r = std.math.nan(f32);
-    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data, 1.0));
 
     glyphs[0].color.r = 1.0;
     glyphs[0].atlas_page = text.max_atlas_pages;
-    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data, 1.0));
 }
 
 test "mask compiler emits compact mask frame data" {
@@ -818,7 +867,7 @@ test "mask compiler emits compact mask frame data" {
     }};
     var scene: Scene = .{
         .clear_color = .{ 0, 0, 0, 1 },
-        .drawable_size = .{ 640.0, 480.0 },
+        .frame_size_points = .{ 640.0, 480.0 },
         .quads = &.{},
         .batches = &.{},
         .clips = &.{.{ .x = 0, .y = 0, .width = 640, .height = 480 }},
@@ -835,19 +884,20 @@ test "mask compiler emits compact mask frame data" {
     };
 
     var frame_data: MaskFrameData = undefined;
-    const result = try compileMasks(&scene, &frame_data);
+    const result = try compileMasks(&scene, &frame_data, 2.0);
 
     try std.testing.expectEqual(@as(u32, vertices_per_mask), result.draw_vertex_count);
     try std.testing.expectEqual(@as(u32, 1), result.mask_count);
     try std.testing.expectEqual(@as(u32, 1), result.batch_count);
-    try std.testing.expectEqual([2]f32{ 640.0, 480.0 }, frame_data.drawable_size);
+    try std.testing.expectEqual([2]f32{ 640.0, 480.0 }, frame_data.frame_size_points);
+    try std.testing.expectEqual(@as(f32, 2.0), frame_data.scale);
     try std.testing.expectEqual(@as(u32, 1), frame_data.mask_count);
     try std.testing.expectEqual(masks[0], frame_data.masks[0]);
     try std.testing.expectEqual(@as(usize, 64), maskFrameDataByteLen(result.mask_count));
 
     scene.masks = &.{};
     scene.mask_batches = &.{};
-    const empty = try compileMasks(&scene, &frame_data);
+    const empty = try compileMasks(&scene, &frame_data, 2.0);
     try std.testing.expectEqual(@as(u32, 0), empty.draw_vertex_count);
     try std.testing.expectEqual(@as(u32, 0), empty.mask_count);
     try std.testing.expectEqual(@as(u32, 0), empty.batch_count);
@@ -863,7 +913,7 @@ test "mask compiler rejects malformed mask batches" {
     var batches = [_]MaskBatch{.{ .vertex_start = 0, .vertex_count = 0, .clip_index = 0 }};
     var scene: Scene = .{
         .clear_color = .{ 0, 0, 0, 1 },
-        .drawable_size = .{ 640.0, 480.0 },
+        .frame_size_points = .{ 640.0, 480.0 },
         .quads = &.{},
         .batches = &.{},
         .clips = clips[0..],
@@ -875,11 +925,11 @@ test "mask compiler rejects malformed mask batches" {
     };
 
     var frame_data: MaskFrameData = undefined;
-    try std.testing.expectError(CompileError.InvalidMaskBatch, compileMasks(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidMaskBatch, compileMasks(&scene, &frame_data, 1.0));
 
     batches[0].vertex_count = vertices_per_mask;
     batches[0].clip_index = 1;
-    try std.testing.expectError(CompileError.InvalidClipIndex, compileMasks(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidClipIndex, compileMasks(&scene, &frame_data, 1.0));
 }
 
 test "mask compiler rejects malformed mask payloads" {
@@ -890,7 +940,7 @@ test "mask compiler rejects malformed mask payloads" {
     }};
     var scene: Scene = .{
         .clear_color = .{ 0, 0, 0, 1 },
-        .drawable_size = .{ 640.0, 480.0 },
+        .frame_size_points = .{ 640.0, 480.0 },
         .quads = &.{},
         .batches = &.{},
         .clips = &.{.{ .x = 0, .y = 0, .width = 640, .height = 480 }},
@@ -903,23 +953,23 @@ test "mask compiler rejects malformed mask payloads" {
     var frame_data: MaskFrameData = undefined;
 
     masks[0].rect.width = -1.0;
-    try std.testing.expectError(CompileError.InvalidMask, compileMasks(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidMask, compileMasks(&scene, &frame_data, 1.0));
 
     masks[0].rect.width = 1.0;
     masks[0].atlas_rect.y = 0.9;
     masks[0].atlas_rect.height = 0.2;
-    try std.testing.expectError(CompileError.InvalidMask, compileMasks(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidMask, compileMasks(&scene, &frame_data, 1.0));
 
     masks[0].atlas_rect.y = 0.0;
     masks[0].atlas_rect.height = 0.25;
     masks[0].color.a = std.math.nan(f32);
-    try std.testing.expectError(CompileError.InvalidMask, compileMasks(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidMask, compileMasks(&scene, &frame_data, 1.0));
 }
 
 test "scene builder rejects invalid geometry and capacity overflow" {
     var storage: SceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 640.0, 480.0 }, .{ 0, 0, 0, 1 });
-    const clip = try builder.pushDrawableClip();
+    const clip = try builder.pushFrameClip();
 
     try std.testing.expectError(SceneBuildError.NoOpenBatch, builder.pushQuad(.{
         .x = 0,
@@ -978,7 +1028,7 @@ test "scene compiler rejects malformed scenes" {
     var batches = [_]Batch{.{ .vertex_start = 0, .vertex_count = vertices_per_quad, .clip_index = 0 }};
     var scene: Scene = .{
         .clear_color = .{ 0, 0, 0, 1 },
-        .drawable_size = .{ 640.0, 480.0 },
+        .frame_size_points = .{ 640.0, 480.0 },
         .quads = quads[0..],
         .batches = batches[0..],
         .clips = clips[0..],
@@ -990,11 +1040,11 @@ test "scene compiler rejects malformed scenes" {
     };
 
     var frame_data: FrameData = undefined;
-    try std.testing.expectError(CompileError.InvalidClipIndex, compileScene(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidClipIndex, compileScene(&scene, &frame_data, 1.0));
 
     quads[0].clip_index = 0;
     batches[0].vertex_count = 0;
-    try std.testing.expectError(CompileError.InvalidBatch, compileScene(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidBatch, compileScene(&scene, &frame_data, 1.0));
 
     var two_clips = [_]ClipRect{
         .{ .x = 0, .y = 0, .width = 640, .height = 480 },
@@ -1004,9 +1054,9 @@ test "scene compiler rejects malformed scenes" {
     batches[0].vertex_count = vertices_per_quad;
     quads[0].clip_index = 1;
     batches[0].clip_index = 0;
-    try std.testing.expectError(CompileError.BatchClipMismatch, compileScene(&scene, &frame_data));
+    try std.testing.expectError(CompileError.BatchClipMismatch, compileScene(&scene, &frame_data, 1.0));
 
     quads[0].clip_index = 0;
     batches[0].clip_index = max_clips;
-    try std.testing.expectError(CompileError.InvalidClipIndex, compileScene(&scene, &frame_data));
+    try std.testing.expectError(CompileError.InvalidClipIndex, compileScene(&scene, &frame_data, 1.0));
 }

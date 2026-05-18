@@ -73,6 +73,7 @@ pub fn LineCacheType(comptime entry_capacity: usize, comptime glyph_capacity: us
     return struct {
         banks: [2]Bank = .{ .{}, .{} },
         active: u32 = 0,
+        generation: u64 = 0,
         scratch: line.TextLineStorage = undefined,
         stats: LineCacheStats = .{},
 
@@ -118,6 +119,11 @@ pub fn LineCacheType(comptime entry_capacity: usize, comptime glyph_capacity: us
         };
 
         pub fn beginFrame(cache: *Self) void {
+            cache.beginFrameGeneration(0);
+        }
+
+        pub fn beginFrameGeneration(cache: *Self, generation: u64) void {
+            cache.ensureGeneration(generation);
             cache.active = 1 - cache.active;
             cache.current().clear();
             cache.stats = .{};
@@ -128,6 +134,12 @@ pub fn LineCacheType(comptime entry_capacity: usize, comptime glyph_capacity: us
             cache.banks[1].clear();
             cache.active = 0;
             cache.stats = .{};
+        }
+
+        pub fn ensureGeneration(cache: *Self, generation: u64) void {
+            if (cache.generation == generation) return;
+            cache.clear();
+            cache.generation = generation;
         }
 
         pub fn lookup(cache: *Self, key: LineCacheKey) defs.Error!?line.TextLine {
@@ -260,6 +272,26 @@ test "line cache hits current and previous frame banks" {
     try std.testing.expectEqual(@as(usize, 2), previous.glyphs.len);
     try std.testing.expectEqual(@as(u32, 1), cache.stats.previous_hits);
     try std.testing.expectEqual(@as(u32, 1), cache.banks[@intCast(cache.active)].entry_count);
+}
+
+test "line cache clears stale banks when atlas generation changes" {
+    var cache: LineCacheType(4, 8) = .{};
+    cache.beginFrameGeneration(1);
+
+    var storage: line.TextLineStorage = undefined;
+    storage.glyphs[0] = .{ .byte_index = 0 };
+    const key: LineCacheKey = .{ .text_hash = 1, .run_hash = 2, .bytes_len = 1, .run_count = 1 };
+    const shaped: line.TextLine = .{
+        .bytes_len = 1,
+        .glyphs = storage.glyphs[0..1],
+    };
+    _ = try cache.store(key, shaped);
+    try std.testing.expect((try cache.lookup(key)) != null);
+
+    cache.beginFrameGeneration(2);
+    try std.testing.expect((try cache.lookup(key)) == null);
+    try std.testing.expectEqual(@as(u64, 2), cache.generation);
+    try std.testing.expectEqual(@as(u32, 1), cache.stats.misses);
 }
 
 test "line cache reports fixed capacity exhaustion" {

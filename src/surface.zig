@@ -69,6 +69,48 @@ const Draw = struct {
     command_count: u32,
 };
 
+pub const RenderMetrics = struct {
+    frame_index: u64 = 0,
+    frame_size_points: [2]f32 = .{ 0.0, 0.0 },
+    drawable_size_pixels: [2]f64 = .{ 0.0, 0.0 },
+    scale: f32 = 1.0,
+    quad_count: u32 = 0,
+    glyph_count: u32 = 0,
+    mask_count: u32 = 0,
+    quad_batch_count: u32 = 0,
+    text_batch_count: u32 = 0,
+    mask_batch_count: u32 = 0,
+    draw_command_count: u32 = 0,
+    draw_call_count: u32 = 0,
+    pipeline_switch_count: u32 = 0,
+    scissor_set_count: u32 = 0,
+    quad_vertex_count: u32 = 0,
+    text_vertex_count: u32 = 0,
+    mask_vertex_count: u32 = 0,
+    frame_data_bytes: u64 = 0,
+    text_data_bytes: u64 = 0,
+    mask_data_bytes: u64 = 0,
+    glyph_upload_count: u32 = 0,
+    glyph_upload_bytes: u64 = 0,
+    mask_upload_count: u32 = 0,
+    mask_upload_bytes: u64 = 0,
+    submitted_area_points: f64 = 0.0,
+    frame_area_points: f64 = 0.0,
+    overdraw_estimate: f32 = 0.0,
+
+    pub fn totalBatchCount(metrics: RenderMetrics) u32 {
+        return metrics.quad_batch_count + metrics.text_batch_count + metrics.mask_batch_count;
+    }
+
+    pub fn totalVertexCount(metrics: RenderMetrics) u32 {
+        return metrics.quad_vertex_count + metrics.text_vertex_count + metrics.mask_vertex_count;
+    }
+
+    pub fn totalUploadBytes(metrics: RenderMetrics) u64 {
+        return metrics.glyph_upload_bytes + metrics.mask_upload_bytes;
+    }
+};
+
 const FontRecord = struct {
     platform: macos_text.PlatformFont = .{},
     generation: u32 = 0,
@@ -257,10 +299,20 @@ pub const Surface = struct {
     frame_event: mtl.resource.OwnedSharedEvent,
     caps: mtl.runtime.DeviceCapabilities,
     current_frame_index: u64 = max_frames_in_flight,
-    drawable_size: mtl.abi.Size2D = .{ .width = 0, .height = 0 },
+    // CAMetalLayer exposes drawableSize as a CGSize in pixel coordinate space.
+    // Keep that API shape here; integer Metal scissors are derived at encoding.
+    drawable_size_pixels: mtl.abi.Size2D = .{ .width = 0, .height = 0 },
     scale: mtl.abi.CGFloat = 1.0,
     resize_generation: u64 = 0,
+    glyph_atlas_generation: u64 = 1,
     config: mtl.layer.Config,
+    current_metrics: RenderMetrics = .{},
+    last_metrics: RenderMetrics = .{},
+    metrics_frame_open: bool = false,
+    pending_glyph_upload_count: u32 = 0,
+    pending_glyph_upload_bytes: u64 = 0,
+    pending_mask_upload_count: u32 = 0,
+    pending_mask_upload_bytes: u64 = 0,
 
     pub fn create(device: ObjCId, config: mtl.layer.Config) Error!*Surface {
         return createWithAllocator(fallback_allocator, device, config);
@@ -420,14 +472,19 @@ pub const Surface = struct {
             .layer_residency_set = layer_residency_set,
             .frame_event = frame_event,
             .caps = caps,
+            .resize_generation = 0,
+            .glyph_atlas_generation = 1,
             .config = config,
+            .current_metrics = .{},
+            .last_metrics = .{},
+            .metrics_frame_open = false,
         };
         return surface;
     }
 
-    pub fn destroy(surface: *Surface) void {
+    pub fn destroy(surface: *Surface) Error!void {
         const alloc = surface.allocator;
-        surface.drain();
+        try surface.drain();
         mtl.command.removeResidencySet(surface.command_queue.ref(), surface.residency_set.ref());
         mtl.resource.endResidency(surface.residency_set.ref());
 
@@ -468,9 +525,38 @@ pub const Surface = struct {
 
     pub fn setMaskAtlas(surface: *Surface, atlas: *const mask.AtlasStorage) Error!void {
         if (!atlas.valid()) return Error.InvalidMask;
-        surface.drain();
+        try surface.drain();
         surface.mask_atlas = atlas.*;
         uploadMaskAtlas(surface.mask_texture.ref(), &surface.mask_atlas);
+        surface.recordMaskUpload(mask.atlas_byte_len);
+    }
+
+    pub fn beginMetricsFrame(surface: *Surface) void {
+        surface.current_metrics = .{
+            .frame_index = surface.current_frame_index,
+            .drawable_size_pixels = .{
+                surface.drawable_size_pixels.width,
+                surface.drawable_size_pixels.height,
+            },
+            .scale = @floatCast(@max(surface.scale, 1.0)),
+            .glyph_upload_count = surface.pending_glyph_upload_count,
+            .glyph_upload_bytes = surface.pending_glyph_upload_bytes,
+            .mask_upload_count = surface.pending_mask_upload_count,
+            .mask_upload_bytes = surface.pending_mask_upload_bytes,
+        };
+        surface.pending_glyph_upload_count = 0;
+        surface.pending_glyph_upload_bytes = 0;
+        surface.pending_mask_upload_count = 0;
+        surface.pending_mask_upload_bytes = 0;
+        surface.metrics_frame_open = true;
+    }
+
+    pub fn renderMetrics(surface: *const Surface) RenderMetrics {
+        return surface.last_metrics;
+    }
+
+    pub fn glyphAtlasGeneration(surface: *const Surface) u64 {
+        return surface.glyph_atlas_generation;
     }
 
     pub fn defaultFont(surface: *const Surface) text.FontHandle {
@@ -724,25 +810,52 @@ pub const Surface = struct {
             atlas.bytes[start..].ptr,
             text.glyph_atlas_width,
         );
+        surface.recordGlyphUpload(@as(u64, glyph.width) * @as(u64, glyph.height));
     }
 
-    pub fn resize(surface: *Surface, drawable_size: mtl.abi.Size2D, scale: mtl.abi.CGFloat) Error!void {
-        if (surface.drawable_size.width == drawable_size.width and
-            surface.drawable_size.height == drawable_size.height and
+    fn recordGlyphUpload(surface: *Surface, byte_len: u64) void {
+        if (surface.metrics_frame_open) {
+            surface.current_metrics.glyph_upload_count +|= 1;
+            surface.current_metrics.glyph_upload_bytes +|= byte_len;
+            return;
+        }
+        surface.pending_glyph_upload_count +|= 1;
+        surface.pending_glyph_upload_bytes +|= byte_len;
+    }
+
+    fn recordMaskUpload(surface: *Surface, byte_len: u64) void {
+        if (surface.metrics_frame_open) {
+            surface.current_metrics.mask_upload_count +|= 1;
+            surface.current_metrics.mask_upload_bytes +|= byte_len;
+            return;
+        }
+        surface.pending_mask_upload_count +|= 1;
+        surface.pending_mask_upload_bytes +|= byte_len;
+    }
+
+    pub fn resize(surface: *Surface, drawable_size_pixels: mtl.abi.Size2D, scale: mtl.abi.CGFloat) Error!void {
+        if (!validDrawableSizePixels(drawable_size_pixels)) return Error.InvalidDrawableSize;
+        if (!validScale(scale)) return Error.InvalidScale;
+
+        if (surface.drawable_size_pixels.width == drawable_size_pixels.width and
+            surface.drawable_size_pixels.height == drawable_size_pixels.height and
             surface.scale == scale)
         {
             return;
         }
 
-        const old_scale: f32 = @floatCast(@max(surface.scale, 1.0));
-        const next_scale: f32 = @floatCast(@max(scale, 1.0));
-        try mtl.layer.resize(surface.layer.ref(), drawable_size, scale);
-        if (old_scale != next_scale) {
-            surface.drain();
+        const scale_changed = surface.scale != scale;
+        if (scale_changed) {
+            try surface.drain();
+        }
+
+        try mtl.layer.resize(surface.layer.ref(), drawable_size_pixels, scale);
+        if (scale_changed) {
             surface.glyph_cache_count = 0;
             for (&surface.glyph_atlases) |*atlas| atlas.clear();
+            surface.glyph_atlas_generation += 1;
         }
-        surface.drawable_size = drawable_size;
+        surface.drawable_size_pixels = drawable_size_pixels;
         surface.scale = scale;
         surface.resize_generation += 1;
     }
@@ -759,9 +872,11 @@ pub const Surface = struct {
         return command_allocator;
     }
 
-    pub fn drain(surface: *Surface) void {
+    pub fn drain(surface: *Surface) Error!void {
         const last_submitted_frame = surface.current_frame_index - 1;
-        _ = mtl.resource.waitUntilSignaledValue(surface.frame_event.ref(), last_submitted_frame, frame_drain_timeout_ms);
+        if (!mtl.resource.waitUntilSignaledValue(surface.frame_event.ref(), last_submitted_frame, frame_drain_timeout_ms)) {
+            return Error.FrameWaitTimedOut;
+        }
     }
 
     pub fn signalFrameCompletion(surface: *Surface) void {
@@ -770,6 +885,7 @@ pub const Surface = struct {
     }
 
     pub fn drawScene(surface: *Surface, frame_scene: *const scene.Scene, drawable_id: ObjCId) Error!void {
+        if (!surface.metrics_frame_open) surface.beginMetricsFrame();
         const drawable = mtl.layer.Drawable.fromRaw(drawable_id orelse return Error.DrawableUnavailable);
         const command_allocator = try surface.nextCommandAllocator();
         const prepared = try surface.prepareScene(frame_scene);
@@ -788,8 +904,8 @@ pub const Surface = struct {
         mtl.render.setViewport(encoder, .{
             .origin_x = 0.0,
             .origin_y = 0.0,
-            .width = surface.drawable_size.width,
-            .height = surface.drawable_size.height,
+            .width = surface.drawable_size_pixels.width,
+            .height = surface.drawable_size_pixels.height,
             .z_near = 0.0,
             .z_far = 1.0,
         });
@@ -811,21 +927,26 @@ pub const Surface = struct {
         surface.signalFrameCompletion();
         mtl.command.signalDrawable(surface.command_queue.ref(), drawable);
         mtl.layer.present(drawable);
+        surface.last_metrics = surface.current_metrics;
+        surface.metrics_frame_open = false;
     }
 
     fn prepareScene(surface: *Surface, frame_scene: *const scene.Scene) Error!Draw {
         const frame_slot = surface.currentFrameSlot();
         const frame = &surface.frames[frame_slot];
 
-        const compiled = scene.compileScene(frame_scene, frame.data) catch return Error.FrameEncodingFailed;
-        const text_compiled = scene.compileText(frame_scene, frame.text_data) catch return Error.FrameEncodingFailed;
-        const mask_compiled = scene.compileMasks(frame_scene, frame.mask_data) catch return Error.FrameEncodingFailed;
+        const frame_scale: f32 = @floatCast(@max(surface.scale, 1.0));
+        const compiled = scene.compileScene(frame_scene, frame.data, frame_scale) catch return Error.FrameEncodingFailed;
+        const text_compiled = scene.compileText(frame_scene, frame.text_data, frame_scale) catch return Error.FrameEncodingFailed;
+        const mask_compiled = scene.compileMasks(frame_scene, frame.mask_data, frame_scale) catch return Error.FrameEncodingFailed;
         if (compiled.quad_count > frame_quad_cap) return Error.BufferCreationFailed;
         const command_count = try surface.buildDrawCommands(frame_scene);
 
         mtl.resource.setAddress(surface.argument_table.ref(), frame.addr, 0);
         mtl.resource.setAddress(surface.argument_table.ref(), frame.text_addr, 1);
         mtl.resource.setAddress(surface.argument_table.ref(), frame.mask_addr, 2);
+
+        surface.current_metrics = surface.preparedMetrics(frame_scene, compiled, text_compiled, mask_compiled, command_count);
 
         return .{
             .clear_color = toClearColor(frame_scene.clear_color),
@@ -839,13 +960,51 @@ pub const Surface = struct {
         };
     }
 
+    fn preparedMetrics(
+        surface: *Surface,
+        frame_scene: *const scene.Scene,
+        compiled: scene.CompileResult,
+        text_compiled: scene.TextCompileResult,
+        mask_compiled: scene.MaskCompileResult,
+        command_count: u32,
+    ) RenderMetrics {
+        var metrics = surface.current_metrics;
+        metrics.frame_index = surface.current_frame_index;
+        metrics.frame_size_points = frame_scene.frame_size_points;
+        metrics.drawable_size_pixels = .{
+            surface.drawable_size_pixels.width,
+            surface.drawable_size_pixels.height,
+        };
+        metrics.scale = @floatCast(@max(surface.scale, 1.0));
+        metrics.quad_count = compiled.quad_count;
+        metrics.glyph_count = text_compiled.glyph_count;
+        metrics.mask_count = mask_compiled.mask_count;
+        metrics.quad_batch_count = compiled.batch_count;
+        metrics.text_batch_count = text_compiled.batch_count;
+        metrics.mask_batch_count = mask_compiled.batch_count;
+        metrics.draw_command_count = command_count;
+        metrics.draw_call_count = command_count;
+        metrics.pipeline_switch_count = countPipelineSwitches(surface.draw_commands[0..@intCast(command_count)]);
+        metrics.scissor_set_count = command_count;
+        metrics.quad_vertex_count = compiled.draw_vertex_count;
+        metrics.text_vertex_count = text_compiled.draw_vertex_count;
+        metrics.mask_vertex_count = mask_compiled.draw_vertex_count;
+        metrics.frame_data_bytes = @intCast(scene.frameDataByteLen(compiled.quad_count));
+        metrics.text_data_bytes = @intCast(scene.textFrameDataByteLen(text_compiled.glyph_count));
+        metrics.mask_data_bytes = @intCast(scene.maskFrameDataByteLen(mask_compiled.mask_count));
+        metrics.submitted_area_points = estimateSubmittedArea(frame_scene);
+        metrics.frame_area_points = frameAreaPoints(frame_scene.frame_size_points);
+        metrics.overdraw_estimate = overdrawEstimate(metrics.submitted_area_points, metrics.frame_area_points);
+        return metrics;
+    }
+
     fn buildDrawCommands(surface: *Surface, frame_scene: *const scene.Scene) Error!u32 {
         const total = frame_scene.batches.len + frame_scene.mask_batches.len + frame_scene.text_batches.len;
         if (total > scene.max_draw_commands) return Error.FrameEncodingFailed;
 
         var count: usize = 0;
         for (frame_scene.batches) |batch| {
-            try validateClipRect(frame_scene.clips[@intCast(batch.clip_index)], frame_scene.drawable_size);
+            try validateClipRect(frame_scene.clips[@intCast(batch.clip_index)], frame_scene.frame_size_points);
             surface.draw_commands[count] = .{
                 .vertex_start = batch.vertex_start,
                 .vertex_count = batch.vertex_count,
@@ -857,7 +1016,7 @@ pub const Surface = struct {
             count += 1;
         }
         for (frame_scene.mask_batches) |batch| {
-            try validateClipRect(frame_scene.clips[@intCast(batch.clip_index)], frame_scene.drawable_size);
+            try validateClipRect(frame_scene.clips[@intCast(batch.clip_index)], frame_scene.frame_size_points);
             surface.draw_commands[count] = .{
                 .vertex_start = batch.vertex_start,
                 .vertex_count = batch.vertex_count,
@@ -869,7 +1028,7 @@ pub const Surface = struct {
             count += 1;
         }
         for (frame_scene.text_batches) |batch| {
-            try validateClipRect(frame_scene.clips[@intCast(batch.clip_index)], frame_scene.drawable_size);
+            try validateClipRect(frame_scene.clips[@intCast(batch.clip_index)], frame_scene.frame_size_points);
             surface.draw_commands[count] = .{
                 .vertex_start = batch.vertex_start,
                 .vertex_count = batch.vertex_count,
@@ -907,7 +1066,7 @@ pub const Surface = struct {
                 }
                 current_kind = command.kind;
             }
-            try drawBatch(encoder, frame_scene.clips[@intCast(command.clip_index)], surface.scale, surface.drawable_size, command.vertex_start, command.vertex_count);
+            try drawBatch(encoder, frame_scene.clips[@intCast(command.clip_index)], surface.scale, surface.drawable_size_pixels, command.vertex_start, command.vertex_count);
         }
     }
 };
@@ -918,15 +1077,85 @@ fn drawCommandLessThan(_: void, lhs: scene.DrawCommand, rhs: scene.DrawCommand) 
     return @intFromEnum(lhs.kind) < @intFromEnum(rhs.kind);
 }
 
+fn countPipelineSwitches(commands: []const scene.DrawCommand) u32 {
+    var count: u32 = 0;
+    var current_kind: ?scene.DrawKind = null;
+    for (commands) |command| {
+        if (current_kind == null or current_kind.? != command.kind) {
+            count += 1;
+            current_kind = command.kind;
+        }
+    }
+    return count;
+}
+
+fn estimateSubmittedArea(frame_scene: *const scene.Scene) f64 {
+    var area: f64 = 0.0;
+
+    for (frame_scene.batches) |batch| {
+        const clip = frame_scene.clips[@intCast(batch.clip_index)];
+        const first_quad: usize = @intCast(batch.vertex_start / scene.vertices_per_quad);
+        const quad_count: usize = @intCast(batch.vertex_count / scene.vertices_per_quad);
+        for (frame_scene.quads[first_quad .. first_quad + quad_count]) |quad| {
+            area += clippedArea(quad.rect.x, quad.rect.y, quad.rect.width, quad.rect.height, clip);
+        }
+    }
+
+    for (frame_scene.text_batches) |batch| {
+        const clip = frame_scene.clips[@intCast(batch.clip_index)];
+        const first_glyph: usize = @intCast(batch.vertex_start / scene.vertices_per_glyph);
+        const glyph_count: usize = @intCast(batch.vertex_count / scene.vertices_per_glyph);
+        for (frame_scene.glyphs[first_glyph .. first_glyph + glyph_count]) |glyph| {
+            area += clippedArea(glyph.rect.x, glyph.rect.y, glyph.rect.width, glyph.rect.height, clip);
+        }
+    }
+
+    for (frame_scene.mask_batches) |batch| {
+        const clip = frame_scene.clips[@intCast(batch.clip_index)];
+        const first_mask: usize = @intCast(batch.vertex_start / scene.vertices_per_mask);
+        const mask_count: usize = @intCast(batch.vertex_count / scene.vertices_per_mask);
+        for (frame_scene.masks[first_mask .. first_mask + mask_count]) |instance| {
+            area += clippedArea(instance.rect.x, instance.rect.y, instance.rect.width, instance.rect.height, clip);
+        }
+    }
+
+    return area;
+}
+
+fn clippedArea(x: f32, y: f32, width: f32, height: f32, clip: scene.ClipRect) f64 {
+    if (width <= 0.0 or height <= 0.0) return 0.0;
+    const clip_x: f32 = @floatFromInt(clip.x);
+    const clip_y: f32 = @floatFromInt(clip.y);
+    const clip_width: f32 = @floatFromInt(clip.width);
+    const clip_height: f32 = @floatFromInt(clip.height);
+    const x0 = @max(x, clip_x);
+    const y0 = @max(y, clip_y);
+    const x1 = @min(x + width, clip_x + clip_width);
+    const y1 = @min(y + height, clip_y + clip_height);
+    const clipped_width = @max(x1 - x0, 0.0);
+    const clipped_height = @max(y1 - y0, 0.0);
+    return @as(f64, clipped_width) * @as(f64, clipped_height);
+}
+
+fn frameAreaPoints(frame_size_points: [2]f32) f64 {
+    if (frame_size_points[0] <= 0.0 or frame_size_points[1] <= 0.0) return 0.0;
+    return @as(f64, frame_size_points[0]) * @as(f64, frame_size_points[1]);
+}
+
+fn overdrawEstimate(submitted_area: f64, drawable_area_value: f64) f32 {
+    if (drawable_area_value <= 0.0) return 0.0;
+    return @floatCast(submitted_area / drawable_area_value);
+}
+
 fn drawBatch(
     encoder: mtl.render.RenderEncoder,
     clip: scene.ClipRect,
     scale: mtl.abi.CGFloat,
-    drawable_size: mtl.abi.Size2D,
+    drawable_size_pixels: mtl.abi.Size2D,
     vertex_start: u32,
     vertex_count: u32,
 ) Error!void {
-    mtl.render.setScissorRect(encoder, try physicalScissorRect(clip, scale, drawable_size));
+    mtl.render.setScissorRect(encoder, try physicalScissorRect(clip, scale, drawable_size_pixels));
     mtl.render.drawPrimitives(
         encoder,
         .triangle,
@@ -1057,24 +1286,28 @@ fn uploadMaskAtlas(texture: mtl.resource.Texture, atlas: *const mask.AtlasStorag
     );
 }
 
-fn validateClipRect(clip: scene.ClipRect, drawable_size: [2]f32) Error!void {
+fn validateClipRect(clip: scene.ClipRect, frame_size_points: [2]f32) Error!void {
     if (clip.width == 0 or clip.height == 0) return Error.InvalidClipRect;
 
-    const drawable_width = try sceneExtent(drawable_size[0]);
-    const drawable_height = try sceneExtent(drawable_size[1]);
-    if (clip.x > drawable_width or clip.width > drawable_width - clip.x) return Error.InvalidClipRect;
-    if (clip.y > drawable_height or clip.height > drawable_height - clip.y) return Error.InvalidClipRect;
+    // Scene clips are integer points with exclusive max edges. Validate against
+    // the same outward-rounded extent produced by Frame.clipRectFromPoints.
+    const frame_width = try pointExtent(frame_size_points[0]);
+    const frame_height = try pointExtent(frame_size_points[1]);
+    if (clip.x > frame_width or clip.width > frame_width - clip.x) return Error.InvalidClipRect;
+    if (clip.y > frame_height or clip.height > frame_height - clip.y) return Error.InvalidClipRect;
 }
 
-fn physicalScissorRect(clip: scene.ClipRect, scale: mtl.abi.CGFloat, drawable_size: mtl.abi.Size2D) Error!mtl.abi.ScissorRect {
+fn physicalScissorRect(clip: scene.ClipRect, scale: mtl.abi.CGFloat, drawable_size_pixels: mtl.abi.Size2D) Error!mtl.abi.ScissorRect {
     if (scale <= 0.0 or !std.math.isFinite(scale)) return Error.InvalidScale;
 
-    const drawable_width = try drawableExtent(drawable_size.width);
-    const drawable_height = try drawableExtent(drawable_size.height);
+    const drawable_width = try drawablePixelExtent(drawable_size_pixels.width);
+    const drawable_height = try drawablePixelExtent(drawable_size_pixels.height);
     const x0 = @floor(@as(f64, @floatFromInt(clip.x)) * scale);
     const y0 = @floor(@as(f64, @floatFromInt(clip.y)) * scale);
-    const x1 = @ceil((@as(f64, @floatFromInt(clip.x)) + @as(f64, @floatFromInt(clip.width))) * scale);
-    const y1 = @ceil((@as(f64, @floatFromInt(clip.y)) + @as(f64, @floatFromInt(clip.height))) * scale);
+    const unclamped_x1 = @ceil((@as(f64, @floatFromInt(clip.x)) + @as(f64, @floatFromInt(clip.width))) * scale);
+    const unclamped_y1 = @ceil((@as(f64, @floatFromInt(clip.y)) + @as(f64, @floatFromInt(clip.height))) * scale);
+    const x1 = @min(unclamped_x1, @as(f64, @floatFromInt(drawable_width)));
+    const y1 = @min(unclamped_y1, @as(f64, @floatFromInt(drawable_height)));
     if (x1 <= x0 or y1 <= y0) return Error.InvalidClipRect;
     if (x0 < 0.0 or y0 < 0.0) return Error.InvalidClipRect;
 
@@ -1093,16 +1326,27 @@ fn physicalScissorRect(clip: scene.ClipRect, scale: mtl.abi.CGFloat, drawable_si
     };
 }
 
-fn sceneExtent(value: f32) Error!u32 {
+fn pointExtent(value: f32) Error!u32 {
     if (value <= 0.0 or !std.math.isFinite(value)) return Error.InvalidDrawableSize;
-    const floored = @floor(value);
-    if (floored <= 0.0) return Error.InvalidDrawableSize;
+    const ceiled = @ceil(value);
+    if (ceiled <= 0.0) return Error.InvalidDrawableSize;
     const max_exact_u32_f32: f32 = 4_294_967_040.0;
-    if (floored >= max_exact_u32_f32) return std.math.maxInt(u32);
-    return @intFromFloat(floored);
+    if (ceiled >= max_exact_u32_f32) return std.math.maxInt(u32);
+    return @intFromFloat(ceiled);
 }
 
-fn drawableExtent(value: f64) Error!u32 {
+fn validDrawableSizePixels(size: mtl.abi.Size2D) bool {
+    return size.width > 0.0 and
+        size.height > 0.0 and
+        std.math.isFinite(size.width) and
+        std.math.isFinite(size.height);
+}
+
+fn validScale(scale: mtl.abi.CGFloat) bool {
+    return scale > 0.0 and std.math.isFinite(scale);
+}
+
+fn drawablePixelExtent(value: f64) Error!u32 {
     if (value <= 0.0 or !std.math.isFinite(value)) return Error.InvalidDrawableSize;
     const floored = @floor(value);
     if (floored <= 0.0) return Error.InvalidDrawableSize;
@@ -1138,9 +1382,12 @@ pub export fn zpui_surface_create_with_options(device: ObjCId, layer_opaque: c_u
     return @intFromEnum(Status.ok);
 }
 
-pub export fn zpui_surface_destroy(surface: ?*Surface) void {
-    const unwrapped_surface = surface orelse return;
-    unwrapped_surface.destroy();
+pub export fn zpui_surface_destroy(surface: ?*Surface) c_int {
+    const unwrapped_surface = surface orelse return @intFromEnum(Status.ok);
+    unwrapped_surface.destroy() catch |err| {
+        return @intFromEnum(Status.fromError(err));
+    };
+    return @intFromEnum(Status.ok);
 }
 
 pub export fn zpui_surface_layer(surface: ?*Surface) ObjCId {
@@ -1204,7 +1451,7 @@ test "surface status values stay stable across the Objective-C ABI" {
     try std.testing.expectEqual(@as(c_int, 71), @intFromEnum(Status.text_line_cache_capacity_exceeded));
 }
 
-test "surface clip validation rejects scissors outside the drawable" {
+test "surface clip validation rejects clips outside the frame points" {
     try validateClipRect(.{ .x = 0, .y = 0, .width = 640, .height = 480 }, .{ 640.0, 480.0 });
     try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 0, .y = 0, .width = 641, .height = 480 }, .{ 640.0, 480.0 }));
     try std.testing.expectError(Error.InvalidClipRect, validateClipRect(.{ .x = 640, .y = 0, .width = 1, .height = 480 }, .{ 640.0, 480.0 }));
@@ -1212,7 +1459,7 @@ test "surface clip validation rejects scissors outside the drawable" {
     try std.testing.expectError(Error.InvalidDrawableSize, validateClipRect(.{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{ 0.0, 480.0 }));
 }
 
-test "surface converts logical clips to physical Metal scissors" {
+test "surface converts point clips to physical Metal scissors" {
     const full = try physicalScissorRect(
         .{ .x = 0, .y = 0, .width = 960, .height = 600 },
         2.0,
@@ -1250,12 +1497,70 @@ test "surface converts logical clips to physical Metal scissors" {
     ));
 }
 
+test "surface clip validation allows outward-rounded fractional logical roots" {
+    try validateClipRect(.{ .x = 0, .y = 0, .width = 667, .height = 334 }, .{ 666.5, 333.5 });
+
+    const scissor = try physicalScissorRect(
+        .{ .x = 0, .y = 0, .width = 667, .height = 334 },
+        2.0,
+        .{ .width = 1333.0, .height = 667.0 },
+    );
+    try std.testing.expectEqual(@as(usize, 0), scissor.x);
+    try std.testing.expectEqual(@as(usize, 0), scissor.y);
+    try std.testing.expectEqual(@as(usize, 1333), scissor.width);
+    try std.testing.expectEqual(@as(usize, 667), scissor.height);
+
+    try std.testing.expectError(Error.InvalidClipRect, validateClipRect(
+        .{ .x = 0, .y = 0, .width = 668, .height = 334 },
+        .{ 666.5, 333.5 },
+    ));
+}
+
+test "surface drawable pixel and scale validation rejects non-finite input" {
+    try std.testing.expect(validDrawableSizePixels(.{ .width = 1333.0, .height = 667.0 }));
+    try std.testing.expect(!validDrawableSizePixels(.{ .width = std.math.nan(f64), .height = 667.0 }));
+    try std.testing.expect(!validDrawableSizePixels(.{ .width = 1333.0, .height = std.math.inf(f64) }));
+    try std.testing.expect(!validDrawableSizePixels(.{ .width = 0.0, .height = 667.0 }));
+
+    try std.testing.expect(validScale(2.0));
+    try std.testing.expect(!validScale(0.0));
+    try std.testing.expect(!validScale(std.math.nan(f64)));
+    try std.testing.expect(!validScale(std.math.inf(f64)));
+}
+
 test "surface frame buffer capacity matches the scene contract" {
     try std.testing.expectEqual(@as(usize, scene.max_quads), frame_quad_cap);
     try std.testing.expectEqual(@sizeOf(scene.FrameData), frame_buf_len);
     try std.testing.expectEqual(@sizeOf(scene.TextFrameData), text_frame_buf_len);
     try std.testing.expectEqual(@sizeOf(scene.MaskFrameData), mask_frame_buf_len);
     try std.testing.expectEqual(@as(usize, max_frames_in_flight * 3 + text.max_atlas_pages + 1), residency_allocation_cap);
+}
+
+test "surface upload metrics carry cold uploads into the next frame" {
+    const surface = try std.testing.allocator.create(Surface);
+    defer std.testing.allocator.destroy(surface);
+
+    surface.current_frame_index = 9;
+    surface.drawable_size_pixels = .{ .width = 200.0, .height = 100.0 };
+    surface.scale = 2.0;
+    surface.current_metrics = .{};
+    surface.last_metrics = .{};
+    surface.metrics_frame_open = false;
+    surface.pending_glyph_upload_count = 0;
+    surface.pending_glyph_upload_bytes = 0;
+    surface.pending_mask_upload_count = 0;
+    surface.pending_mask_upload_bytes = 0;
+
+    surface.recordGlyphUpload(32);
+    surface.recordMaskUpload(64);
+    surface.beginMetricsFrame();
+
+    try std.testing.expectEqual(@as(u32, 1), surface.current_metrics.glyph_upload_count);
+    try std.testing.expectEqual(@as(u64, 32), surface.current_metrics.glyph_upload_bytes);
+    try std.testing.expectEqual(@as(u32, 1), surface.current_metrics.mask_upload_count);
+    try std.testing.expectEqual(@as(u64, 64), surface.current_metrics.mask_upload_bytes);
+    try std.testing.expectEqual(@as(u32, 0), surface.pending_glyph_upload_count);
+    try std.testing.expectEqual(@as(u64, 0), surface.pending_glyph_upload_bytes);
 }
 
 test "surface draw commands preserve layer and frame order" {
@@ -1276,4 +1581,57 @@ test "surface draw commands preserve layer and frame order" {
     try std.testing.expectEqual(@as(u32, 2), commands[2].order);
     try std.testing.expectEqual(scene.DrawKind.mask, commands[2].kind);
     try std.testing.expectEqual(scene.layer_foreground, commands[3].layer);
+}
+
+test "surface metrics count pipeline switches from sorted draw commands" {
+    const commands = [_]scene.DrawCommand{
+        .{ .vertex_start = 0, .vertex_count = 6, .clip_index = 0, .layer = 0, .order = 0, .kind = .quad },
+        .{ .vertex_start = 6, .vertex_count = 6, .clip_index = 0, .layer = 0, .order = 1, .kind = .quad },
+        .{ .vertex_start = 0, .vertex_count = 6, .clip_index = 0, .layer = 0, .order = 2, .kind = .text },
+        .{ .vertex_start = 0, .vertex_count = 6, .clip_index = 0, .layer = 0, .order = 3, .kind = .mask },
+        .{ .vertex_start = 6, .vertex_count = 6, .clip_index = 0, .layer = 0, .order = 4, .kind = .text },
+    };
+
+    try std.testing.expectEqual(@as(u32, 4), countPipelineSwitches(commands[0..]));
+    try std.testing.expectEqual(@as(u32, 0), countPipelineSwitches(&.{}));
+}
+
+test "surface metrics estimate clipped submitted area" {
+    var storage: scene.SceneStorage = .{};
+    var builder = scene.SceneBuilder.begin(&storage, .{ 100.0, 100.0 }, .{ 0.0, 0.0, 0.0, 1.0 });
+    const full_clip = try builder.pushFrameClip();
+    const small_clip = try builder.pushClip(.{ .x = 10, .y = 10, .width = 20, .height = 20 });
+
+    try builder.beginLayerBatch(full_clip, scene.layer_background);
+    try builder.pushQuad(.{ .x = 0.0, .y = 0.0, .width = 100.0, .height = 100.0 }, .{ 1.0, 1.0, 1.0, 1.0 }, full_clip);
+    try builder.endBatch();
+
+    try builder.beginLayerBatch(small_clip, scene.layer_surface);
+    try builder.pushQuad(.{ .x = 0.0, .y = 0.0, .width = 100.0, .height = 100.0 }, .{ 1.0, 0.0, 0.0, 1.0 }, small_clip);
+    try builder.endBatch();
+
+    const out = try builder.finish();
+    const submitted = estimateSubmittedArea(&out);
+    const frame_area = frameAreaPoints(out.frame_size_points);
+
+    try std.testing.expectEqual(@as(f64, 10_400.0), submitted);
+    try std.testing.expectEqual(@as(f64, 10_000.0), frame_area);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.04), overdrawEstimate(submitted, frame_area), 0.001);
+}
+
+test "render metrics totals stay derived from explicit counters" {
+    const metrics: RenderMetrics = .{
+        .quad_batch_count = 2,
+        .text_batch_count = 3,
+        .mask_batch_count = 5,
+        .quad_vertex_count = 12,
+        .text_vertex_count = 18,
+        .mask_vertex_count = 30,
+        .glyph_upload_bytes = 128,
+        .mask_upload_bytes = 256,
+    };
+
+    try std.testing.expectEqual(@as(u32, 10), metrics.totalBatchCount());
+    try std.testing.expectEqual(@as(u32, 60), metrics.totalVertexCount());
+    try std.testing.expectEqual(@as(u64, 384), metrics.totalUploadBytes());
 }

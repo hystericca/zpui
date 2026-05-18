@@ -124,7 +124,7 @@ pub const WindowChrome = struct {
 
 pub const WindowOptions = struct {
     title: [:0]const u8 = "ZPUI",
-    size: [2]f64 = .{ 960.0, 600.0 },
+    size_points: [2]f64 = .{ 960.0, 600.0 },
     chrome: WindowChrome = .{},
     draw: DrawFn = drawClear,
     user_data: ?*anyopaque = null,
@@ -259,8 +259,8 @@ pub const DrawContext = opaque {
         return ctx.native().surface.shapeLine(storage, runs);
     }
 
-    pub fn beginTextFrame(_: *DrawContext, cache: anytype) void {
-        cache.beginFrame();
+    pub fn beginTextFrame(ctx: *DrawContext, cache: anytype) void {
+        cache.beginFrameGeneration(ctx.native().surface.glyphAtlasGeneration());
     }
 
     pub fn layoutLineCached(ctx: *DrawContext, cache: anytype, runs: []const text.TextRun) surface.Error!text.TextLine {
@@ -268,6 +268,7 @@ pub const DrawContext = opaque {
     }
 
     pub fn layoutLineCachedKey(ctx: *DrawContext, cache: anytype, key: text.LineCacheKey, runs: []const text.TextRun) surface.Error!text.TextLine {
+        cache.ensureGeneration(ctx.native().surface.glyphAtlasGeneration());
         if (try cache.lookup(key)) |cached| return cached;
 
         const shaped = try ctx.native().surface.shapeLine(&cache.scratch, runs);
@@ -296,17 +297,22 @@ pub const DrawContext = opaque {
 
     pub fn beginFrame(ctx: *DrawContext, options: FrameOptions) frame.Frame {
         const native_ctx = ctx.native();
+        native_ctx.surface.beginMetricsFrame();
         const input_snapshot = options.input orelse native_ctx.input_storage.read();
         const scale: f32 = @floatCast(@max(native_ctx.surface.scale, 1.0));
         return frame.Frame.begin(&native_ctx.surface.frame_storage, .{
-            .size = .{
-                @as(f32, @floatCast(native_ctx.surface.drawable_size.width)) / scale,
-                @as(f32, @floatCast(native_ctx.surface.drawable_size.height)) / scale,
+            .frame_size_points = .{
+                @as(f32, @floatCast(native_ctx.surface.drawable_size_pixels.width)) / scale,
+                @as(f32, @floatCast(native_ctx.surface.drawable_size_pixels.height)) / scale,
             },
             .scale = scale,
             .clear_color = options.clear_color,
             .input = input_snapshot,
         });
+    }
+
+    pub fn renderMetrics(ctx: *DrawContext) surface.RenderMetrics {
+        return ctx.native().surface.renderMetrics();
     }
 
     pub fn drawScene(ctx: *DrawContext, frame_scene: *const scene.Scene) surface.Error!void {
@@ -358,6 +364,11 @@ fn drawErrorStatus(err: DrawError) surface.Status {
         error.NoOpenBatch,
         error.BatchClipMismatch,
         error.OutputTooSmall,
+        error.InvalidBounds,
+        error.InvalidGap,
+        error.InvalidConstraints,
+        error.InvalidSize,
+        error.NumericOverflow,
         error.NoFont,
         error.GlyphCapacityExceeded,
         error.MissingGlyph,
@@ -371,10 +382,10 @@ fn drawErrorStatus(err: DrawError) surface.Status {
 pub fn initWindow(options: WindowOptions) Error!void {
     if (builtin.os.tag != .macos) return Error.UnsupportedPlatform;
     if (options.title.len == 0 or
-        options.size[0] <= 0.0 or
-        options.size[1] <= 0.0 or
-        !std.math.isFinite(options.size[0]) or
-        !std.math.isFinite(options.size[1]) or
+        options.size_points[0] <= 0.0 or
+        options.size_points[1] <= 0.0 or
+        !std.math.isFinite(options.size_points[0]) or
+        !std.math.isFinite(options.size_points[1]) or
         !options.chrome.valid())
     {
         return Error.InvalidWindowOptions;
@@ -387,7 +398,7 @@ pub fn initWindow(options: WindowOptions) Error!void {
         active_user_data = null;
     }
 
-    return switch (zpui_macos_init_window(options.title.ptr, options.size[0], options.size[1], options.chrome.raw())) {
+    return switch (zpui_macos_init_window(options.title.ptr, options.size_points[0], options.size_points[1], options.chrome.raw())) {
         0 => {},
         2 => Error.MetalUnavailable,
         else => Error.CocoaStartupFailed,
@@ -419,4 +430,12 @@ test "macos window chrome rejects impossible titlebar combinations" {
     try std.testing.expect(!(WindowChrome{ .titled = false, .titlebar_transparent = true }).valid());
     try std.testing.expect(!(WindowChrome{ .traffic_light_position = .{ -1.0, 0.0 } }).valid());
     try std.testing.expect(!(WindowChrome{ .traffic_light_position = .{ std.math.inf(f64), 0.0 } }).valid());
+}
+
+test "draw error status covers layout errors without error-cast traps" {
+    try std.testing.expectEqual(surface.Status.frame_encoding_failed, drawErrorStatus(error.InvalidBounds));
+    try std.testing.expectEqual(surface.Status.frame_encoding_failed, drawErrorStatus(error.InvalidGap));
+    try std.testing.expectEqual(surface.Status.frame_encoding_failed, drawErrorStatus(error.InvalidConstraints));
+    try std.testing.expectEqual(surface.Status.frame_encoding_failed, drawErrorStatus(error.InvalidSize));
+    try std.testing.expectEqual(surface.Status.frame_encoding_failed, drawErrorStatus(error.NumericOverflow));
 }

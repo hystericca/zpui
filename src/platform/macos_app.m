@@ -297,7 +297,7 @@ enum {
 extern int zpui_surface_create(id device, ZPUISurface **outSurface);
 extern int zpui_surface_create_with_options(id device, unsigned int layerOpaque,
                                             ZPUISurface **outSurface);
-extern void zpui_surface_destroy(ZPUISurface *surface);
+extern int zpui_surface_destroy(ZPUISurface *surface);
 extern CAMetalLayer *zpui_surface_layer(ZPUISurface *surface);
 extern int zpui_surface_resize(ZPUISurface *surface, double width, double height, double scale);
 extern int zpui_macos_draw_frame(ZPUISurface *surface, id<CAMetalDrawable> drawable);
@@ -472,23 +472,87 @@ static void zpui_record_key_event(uint32_t kind, NSEvent *event, uint32_t logica
     key->timestamp = event.timestamp;
 }
 
+static BOOL zpui_is_high_surrogate(unichar value) {
+    return value >= 0xD800 && value <= 0xDBFF;
+}
+
+static BOOL zpui_is_low_surrogate(unichar value) {
+    return value >= 0xDC00 && value <= 0xDFFF;
+}
+
+static BOOL zpui_next_utf32_scalar(NSString *text, NSUInteger *index, uint32_t *scalar) {
+    if (*index >= text.length) {
+        return NO;
+    }
+
+    unichar first = [text characterAtIndex:*index];
+    *index += 1;
+
+    if (zpui_is_high_surrogate(first)) {
+        if (*index < text.length) {
+            unichar second = [text characterAtIndex:*index];
+            if (zpui_is_low_surrogate(second)) {
+                *index += 1;
+                *scalar = 0x10000u + (((uint32_t)first - 0xD800u) << 10) +
+                          ((uint32_t)second - 0xDC00u);
+                return YES;
+            }
+        }
+        return NO;
+    }
+
+    if (zpui_is_low_surrogate(first)) {
+        return NO;
+    }
+
+    *scalar = (uint32_t)first;
+    return YES;
+}
+
+static NSUInteger zpui_encode_utf8_scalar(uint32_t scalar, uint8_t bytes[8]) {
+    if (scalar <= 0x7Fu) {
+        bytes[0] = (uint8_t)scalar;
+        return 1;
+    }
+    if (scalar <= 0x7FFu) {
+        bytes[0] = (uint8_t)(0xC0u | (scalar >> 6));
+        bytes[1] = (uint8_t)(0x80u | (scalar & 0x3Fu));
+        return 2;
+    }
+    if (scalar >= 0xD800u && scalar <= 0xDFFFu) {
+        return 0;
+    }
+    if (scalar <= 0xFFFFu) {
+        bytes[0] = (uint8_t)(0xE0u | (scalar >> 12));
+        bytes[1] = (uint8_t)(0x80u | ((scalar >> 6) & 0x3Fu));
+        bytes[2] = (uint8_t)(0x80u | (scalar & 0x3Fu));
+        return 3;
+    }
+    if (scalar <= 0x10FFFFu) {
+        bytes[0] = (uint8_t)(0xF0u | (scalar >> 18));
+        bytes[1] = (uint8_t)(0x80u | ((scalar >> 12) & 0x3Fu));
+        bytes[2] = (uint8_t)(0x80u | ((scalar >> 6) & 0x3Fu));
+        bytes[3] = (uint8_t)(0x80u | (scalar & 0x3Fu));
+        return 4;
+    }
+    return 0;
+}
+
 static void zpui_record_text_events(NSString *text, NSEvent *event) {
     if (text.length == 0) {
         return;
     }
 
-    for (NSUInteger i = 0;
-         i < text.length && zpuiInputState.text_count < ZPUI_INPUT_MAX_TEXT_EVENTS; i++) {
+    NSUInteger index = 0;
+    while (index < text.length && zpuiInputState.text_count < ZPUI_INPUT_MAX_TEXT_EVENTS) {
+        uint32_t scalar = 0;
+        if (!zpui_next_utf32_scalar(text, &index, &scalar)) {
+            continue;
+        }
+
         uint8_t bytes[8] = {0};
-        NSUInteger used = 0;
-        BOOL ok = [text getBytes:bytes
-                       maxLength:sizeof(bytes)
-                      usedLength:&used
-                        encoding:NSUTF8StringEncoding
-                         options:0
-                           range:NSMakeRange(i, 1)
-                  remainingRange:NULL];
-        if (!ok || used == 0 || used > sizeof(bytes)) {
+        NSUInteger used = zpui_encode_utf8_scalar(scalar, bytes);
+        if (used == 0 || used > sizeof(bytes)) {
             continue;
         }
 
@@ -1938,7 +2002,11 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
 }
 
 - (void)dealloc {
-    zpui_surface_destroy(_surface);
+    int status = zpui_surface_destroy(_surface);
+    if (status != 0) {
+        fprintf(stderr, "ZPUI: failed to destroy surface in Zig: %s (%d)\n",
+                zpui_platform_status_name(status), status);
+    }
     _surface = NULL;
 #if !__has_feature(objc_arc)
     [super dealloc];
