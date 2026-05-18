@@ -23,14 +23,144 @@ pub const FrameOptions = struct {
     input: ?frame.InputSnapshot = null,
 };
 
+pub const WindowBackground = enum(u32) {
+    solid = 0, // should be "opaque" but it's a Zig keyword
+    transparent = 1,
+    blurred = 2,
+};
+
+pub const WindowAppearance = enum(u32) {
+    system = 0,
+    aqua = 1,
+    dark_aqua = 2,
+    vibrant_light = 3,
+    vibrant_dark = 4,
+};
+
+pub const WindowToolbarStyle = enum(u32) {
+    automatic = 0,
+    expanded = 1,
+    preference = 2,
+    unified = 3,
+    unified_compact = 4,
+};
+
+pub const WindowTitlebarSeparatorStyle = enum(u32) {
+    automatic = 0,
+    none = 1,
+    line = 2,
+    shadow = 3,
+};
+
+pub const WindowChrome = struct {
+    titled: bool = true,
+    closable: bool = true,
+    miniaturizable: bool = true,
+    resizable: bool = true,
+    full_size_content: bool = false,
+    titlebar_transparent: bool = false,
+    title_visible: bool = true,
+    movable: bool = true,
+    movable_by_background: bool = false,
+    has_shadow: bool = true,
+    traffic_light_position: ?[2]f64 = null,
+    background: WindowBackground = .solid,
+    appearance: WindowAppearance = .system,
+    toolbar_style: WindowToolbarStyle = .automatic,
+    titlebar_separator_style: WindowTitlebarSeparatorStyle = .automatic,
+
+    pub fn customTitlebar(traffic_light_position: ?[2]f64) WindowChrome {
+        return .{
+            .full_size_content = true,
+            .titlebar_transparent = true,
+            .title_visible = false,
+            .movable_by_background = true,
+            .titlebar_separator_style = .none,
+            .traffic_light_position = traffic_light_position,
+        };
+    }
+
+    fn raw(chrome: WindowChrome) RawWindowChrome {
+        var flags: u32 = 0;
+        if (chrome.titled) flags |= raw_window_titled;
+        if (chrome.closable) flags |= raw_window_closable;
+        if (chrome.miniaturizable) flags |= raw_window_miniaturizable;
+        if (chrome.resizable) flags |= raw_window_resizable;
+        if (chrome.full_size_content or chrome.titlebar_transparent) flags |= raw_window_full_size_content;
+        if (chrome.titlebar_transparent) flags |= raw_window_titlebar_transparent;
+        if (chrome.title_visible) flags |= raw_window_title_visible;
+        if (chrome.movable) flags |= raw_window_movable;
+        if (chrome.movable_by_background) flags |= raw_window_movable_by_background;
+        if (chrome.has_shadow) flags |= raw_window_has_shadow;
+
+        var traffic_light_x: f64 = 0.0;
+        var traffic_light_y: f64 = 0.0;
+        if (chrome.traffic_light_position) |position| {
+            flags |= raw_window_traffic_light_position;
+            traffic_light_x = position[0];
+            traffic_light_y = position[1];
+        }
+
+        return .{
+            .flags = flags,
+            .background = @intFromEnum(chrome.background),
+            .toolbar_style = @intFromEnum(chrome.toolbar_style),
+            .titlebar_separator_style = @intFromEnum(chrome.titlebar_separator_style),
+            .appearance = @intFromEnum(chrome.appearance),
+            .traffic_light_x = traffic_light_x,
+            .traffic_light_y = traffic_light_y,
+        };
+    }
+
+    fn valid(chrome: WindowChrome) bool {
+        if (!chrome.titled and (chrome.full_size_content or chrome.titlebar_transparent or chrome.traffic_light_position != null)) return false;
+        if (chrome.traffic_light_position) |position| {
+            if (position[0] < 0.0 or position[1] < 0.0) return false;
+            if (!std.math.isFinite(position[0]) or !std.math.isFinite(position[1])) return false;
+        }
+        return true;
+    }
+};
+
 pub const WindowOptions = struct {
     title: [:0]const u8 = "ZPUI",
     size: [2]f64 = .{ 960.0, 600.0 },
+    chrome: WindowChrome = .{},
     draw: DrawFn = drawClear,
     user_data: ?*anyopaque = null,
 };
 
-extern fn zpui_macos_init_window(title: [*:0]const u8, width: f64, height: f64) c_int;
+const raw_window_titled: u32 = 1 << 0;
+const raw_window_closable: u32 = 1 << 1;
+const raw_window_miniaturizable: u32 = 1 << 2;
+const raw_window_resizable: u32 = 1 << 3;
+const raw_window_full_size_content: u32 = 1 << 4;
+const raw_window_titlebar_transparent: u32 = 1 << 5;
+const raw_window_title_visible: u32 = 1 << 6;
+const raw_window_movable: u32 = 1 << 7;
+const raw_window_movable_by_background: u32 = 1 << 8;
+const raw_window_has_shadow: u32 = 1 << 9;
+const raw_window_traffic_light_position: u32 = 1 << 10;
+
+const RawWindowChrome = extern struct {
+    flags: u32 = 0,
+    background: u32 = 0,
+    toolbar_style: u32 = 0,
+    titlebar_separator_style: u32 = 0,
+    appearance: u32 = 0,
+    reserved: u32 = 0,
+    traffic_light_x: f64 = 0.0,
+    traffic_light_y: f64 = 0.0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(RawWindowChrome) == 40);
+    std.debug.assert(@offsetOf(RawWindowChrome, "flags") == 0);
+    std.debug.assert(@offsetOf(RawWindowChrome, "traffic_light_x") == 24);
+    std.debug.assert(@offsetOf(RawWindowChrome, "traffic_light_y") == 32);
+}
+
+extern fn zpui_macos_init_window(title: [*:0]const u8, width: f64, height: f64, chrome: RawWindowChrome) c_int;
 extern fn zpui_macos_request_redraw() void;
 extern fn zpui_macos_input_snapshot(out: *RawInputSnapshot) void;
 
@@ -171,6 +301,7 @@ var active_user_data: ?*anyopaque = null;
 
 comptime {
     _ = surface.zpui_surface_create;
+    _ = surface.zpui_surface_create_with_options;
     _ = surface.zpui_surface_destroy;
     _ = surface.zpui_surface_layer;
     _ = surface.zpui_surface_resize;
@@ -220,7 +351,13 @@ fn drawErrorStatus(err: DrawError) surface.Status {
 
 pub fn initWindow(options: WindowOptions) Error!void {
     if (builtin.os.tag != .macos) return Error.UnsupportedPlatform;
-    if (options.title.len == 0 or options.size[0] <= 0.0 or options.size[1] <= 0.0) {
+    if (options.title.len == 0 or
+        options.size[0] <= 0.0 or
+        options.size[1] <= 0.0 or
+        !std.math.isFinite(options.size[0]) or
+        !std.math.isFinite(options.size[1]) or
+        !options.chrome.valid())
+    {
         return Error.InvalidWindowOptions;
     }
 
@@ -231,7 +368,7 @@ pub fn initWindow(options: WindowOptions) Error!void {
         active_user_data = null;
     }
 
-    return switch (zpui_macos_init_window(options.title.ptr, options.size[0], options.size[1])) {
+    return switch (zpui_macos_init_window(options.title.ptr, options.size[0], options.size[1], options.chrome.raw())) {
         0 => {},
         2 => Error.MetalUnavailable,
         else => Error.CocoaStartupFailed,
@@ -250,4 +387,25 @@ fn drawClear(ctx: *DrawContext) DrawError!void {
     var f = ctx.beginFrame(.{});
     const out = try f.finish();
     try ctx.drawScene(&out);
+}
+
+test "macos window chrome packs into stable Objective C ABI data" {
+    const chrome = WindowChrome.customTitlebar(.{ 12.0, 10.0 });
+    const raw = chrome.raw();
+
+    try std.testing.expect(chrome.valid());
+    try std.testing.expect((raw.flags & raw_window_titled) != 0);
+    try std.testing.expect((raw.flags & raw_window_full_size_content) != 0);
+    try std.testing.expect((raw.flags & raw_window_titlebar_transparent) != 0);
+    try std.testing.expect((raw.flags & raw_window_title_visible) == 0);
+    try std.testing.expect((raw.flags & raw_window_movable_by_background) != 0);
+    try std.testing.expect((raw.flags & raw_window_traffic_light_position) != 0);
+    try std.testing.expectEqual(@as(f64, 12.0), raw.traffic_light_x);
+    try std.testing.expectEqual(@as(f64, 10.0), raw.traffic_light_y);
+}
+
+test "macos window chrome rejects impossible titlebar combinations" {
+    try std.testing.expect(!(WindowChrome{ .titled = false, .titlebar_transparent = true }).valid());
+    try std.testing.expect(!(WindowChrome{ .traffic_light_position = .{ -1.0, 0.0 } }).valid());
+    try std.testing.expect(!(WindowChrome{ .traffic_light_position = .{ std.math.inf(f64), 0.0 } }).valid());
 }

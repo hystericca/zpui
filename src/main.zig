@@ -3,6 +3,7 @@ const zpui = @import("zpui-app");
 pub fn main() !void {
     try zpui.initWindow(.{
         .title = "ZPUI Visual Primitives",
+        .chrome = zpui.WindowChrome.customTitlebar(.{ 14.0, 11.0 }),
         .draw = draw,
     });
 }

@@ -948,8 +948,12 @@ fn buildTextAtlas(font: *text.Font, atlas: *text.AtlasStorage, options: text.Fon
 }
 
 pub export fn zpui_surface_create(device: ObjCId, out_surface: *?*Surface) c_int {
+    return zpui_surface_create_with_options(device, 1, out_surface);
+}
+
+pub export fn zpui_surface_create_with_options(device: ObjCId, layer_opaque: c_uint, out_surface: *?*Surface) c_int {
     out_surface.* = null;
-    const surface = Surface.create(device, .{}) catch |err| {
+    const surface = Surface.create(device, .{ .is_opaque = layer_opaque != 0 }) catch |err| {
         return @intFromEnum(Status.fromError(err));
     };
     out_surface.* = surface;

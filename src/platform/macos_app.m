@@ -2,8 +2,8 @@
 #import <CoreText/CoreText.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
-#import <math.h>
 #import <mach-o/dyld.h>
+#import <math.h>
 #import <stdatomic.h>
 #import <stddef.h>
 #import <stdint.h>
@@ -12,6 +12,67 @@
 #import <string.h>
 
 typedef struct ZPUISurface ZPUISurface;
+
+enum {
+    ZPUI_WINDOW_TITLED = 1u << 0,
+    ZPUI_WINDOW_CLOSABLE = 1u << 1,
+    ZPUI_WINDOW_MINIATURIZABLE = 1u << 2,
+    ZPUI_WINDOW_RESIZABLE = 1u << 3,
+    ZPUI_WINDOW_FULL_SIZE_CONTENT = 1u << 4,
+    ZPUI_WINDOW_TITLEBAR_TRANSPARENT = 1u << 5,
+    ZPUI_WINDOW_TITLE_VISIBLE = 1u << 6,
+    ZPUI_WINDOW_MOVABLE = 1u << 7,
+    ZPUI_WINDOW_MOVABLE_BY_BACKGROUND = 1u << 8,
+    ZPUI_WINDOW_HAS_SHADOW = 1u << 9,
+    ZPUI_WINDOW_TRAFFIC_LIGHT_POSITION = 1u << 10,
+};
+
+enum {
+    ZPUI_WINDOW_BACKGROUND_OPAQUE = 0,
+    ZPUI_WINDOW_BACKGROUND_TRANSPARENT = 1,
+    ZPUI_WINDOW_BACKGROUND_BLURRED = 2,
+};
+
+enum {
+    ZPUI_WINDOW_APPEARANCE_SYSTEM = 0,
+    ZPUI_WINDOW_APPEARANCE_AQUA = 1,
+    ZPUI_WINDOW_APPEARANCE_DARK_AQUA = 2,
+    ZPUI_WINDOW_APPEARANCE_VIBRANT_LIGHT = 3,
+    ZPUI_WINDOW_APPEARANCE_VIBRANT_DARK = 4,
+};
+
+enum {
+    ZPUI_WINDOW_TOOLBAR_STYLE_AUTOMATIC = 0,
+    ZPUI_WINDOW_TOOLBAR_STYLE_EXPANDED = 1,
+    ZPUI_WINDOW_TOOLBAR_STYLE_PREFERENCE = 2,
+    ZPUI_WINDOW_TOOLBAR_STYLE_UNIFIED = 3,
+    ZPUI_WINDOW_TOOLBAR_STYLE_UNIFIED_COMPACT = 4,
+};
+
+enum {
+    ZPUI_WINDOW_TITLEBAR_SEPARATOR_AUTOMATIC = 0,
+    ZPUI_WINDOW_TITLEBAR_SEPARATOR_NONE = 1,
+    ZPUI_WINDOW_TITLEBAR_SEPARATOR_LINE = 2,
+    ZPUI_WINDOW_TITLEBAR_SEPARATOR_SHADOW = 3,
+};
+
+typedef struct {
+    uint32_t flags;
+    uint32_t background;
+    uint32_t toolbar_style;
+    uint32_t titlebar_separator_style;
+    uint32_t appearance;
+    uint32_t reserved;
+    double traffic_light_x;
+    double traffic_light_y;
+} ZPUIWindowChrome;
+
+_Static_assert(sizeof(ZPUIWindowChrome) == 40, "ZPUIWindowChrome ABI size mismatch");
+_Static_assert(offsetof(ZPUIWindowChrome, flags) == 0, "ZPUIWindowChrome flags offset mismatch");
+_Static_assert(offsetof(ZPUIWindowChrome, traffic_light_x) == 24,
+               "ZPUIWindowChrome traffic_light_x offset mismatch");
+_Static_assert(offsetof(ZPUIWindowChrome, traffic_light_y) == 32,
+               "ZPUIWindowChrome traffic_light_y offset mismatch");
 
 typedef struct {
     float size;
@@ -137,13 +198,20 @@ typedef struct {
 } ZPUIRawInputSnapshot;
 
 _Static_assert(sizeof(ZPUIRawInputSnapshot) == 6696, "ZPUIRawInputSnapshot ABI size mismatch");
-_Static_assert(offsetof(ZPUIRawInputSnapshot, has_cursor) == 0, "ZPUIRawInputSnapshot has_cursor offset mismatch");
-_Static_assert(offsetof(ZPUIRawInputSnapshot, cursor_x) == 16, "ZPUIRawInputSnapshot cursor_x offset mismatch");
-_Static_assert(offsetof(ZPUIRawInputSnapshot, key_count) == 24, "ZPUIRawInputSnapshot key_count offset mismatch");
-_Static_assert(offsetof(ZPUIRawInputSnapshot, keys) == 40, "ZPUIRawInputSnapshot keys offset mismatch");
-_Static_assert(offsetof(ZPUIRawInputSnapshot, text) == 2088, "ZPUIRawInputSnapshot text offset mismatch");
-_Static_assert(offsetof(ZPUIRawInputSnapshot, mouse) == 3624, "ZPUIRawInputSnapshot mouse offset mismatch");
-_Static_assert(offsetof(ZPUIRawInputSnapshot, scroll) == 5672, "ZPUIRawInputSnapshot scroll offset mismatch");
+_Static_assert(offsetof(ZPUIRawInputSnapshot, has_cursor) == 0,
+               "ZPUIRawInputSnapshot has_cursor offset mismatch");
+_Static_assert(offsetof(ZPUIRawInputSnapshot, cursor_x) == 16,
+               "ZPUIRawInputSnapshot cursor_x offset mismatch");
+_Static_assert(offsetof(ZPUIRawInputSnapshot, key_count) == 24,
+               "ZPUIRawInputSnapshot key_count offset mismatch");
+_Static_assert(offsetof(ZPUIRawInputSnapshot, keys) == 40,
+               "ZPUIRawInputSnapshot keys offset mismatch");
+_Static_assert(offsetof(ZPUIRawInputSnapshot, text) == 2088,
+               "ZPUIRawInputSnapshot text offset mismatch");
+_Static_assert(offsetof(ZPUIRawInputSnapshot, mouse) == 3624,
+               "ZPUIRawInputSnapshot mouse offset mismatch");
+_Static_assert(offsetof(ZPUIRawInputSnapshot, scroll) == 5672,
+               "ZPUIRawInputSnapshot scroll offset mismatch");
 
 enum {
     ZPUI_TEXT_GLYPH_PRESENT = 1u << 0,
@@ -158,6 +226,8 @@ enum {
 };
 
 extern int zpui_surface_create(id device, ZPUISurface **outSurface);
+extern int zpui_surface_create_with_options(id device, unsigned int layerOpaque,
+                                            ZPUISurface **outSurface);
 extern void zpui_surface_destroy(ZPUISurface *surface);
 extern CAMetalLayer *zpui_surface_layer(ZPUISurface *surface);
 extern int zpui_surface_resize(ZPUISurface *surface, double width, double height, double scale);
@@ -304,10 +374,7 @@ static uint32_t zpui_modifiers(NSEventModifierFlags flags) {
     return mods;
 }
 
-static void zpui_record_key_event(uint32_t kind,
-                                  NSEvent *event,
-                                  uint32_t logical,
-                                  uint32_t flags) {
+static void zpui_record_key_event(uint32_t kind, NSEvent *event, uint32_t logical, uint32_t flags) {
     zpuiInputState.mods = zpui_modifiers(event.modifierFlags);
     if (zpuiInputState.key_count >= ZPUI_INPUT_MAX_KEY_EVENTS) {
         return;
@@ -327,8 +394,8 @@ static void zpui_record_text_events(NSString *text, NSEvent *event) {
         return;
     }
 
-    for (NSUInteger i = 0; i < text.length && zpuiInputState.text_count < ZPUI_INPUT_MAX_TEXT_EVENTS;
-         i++) {
+    for (NSUInteger i = 0;
+         i < text.length && zpuiInputState.text_count < ZPUI_INPUT_MAX_TEXT_EVENTS; i++) {
         uint8_t bytes[8] = {0};
         NSUInteger used = 0;
         BOOL ok = [text getBytes:bytes
@@ -350,21 +417,7 @@ static void zpui_record_text_events(NSString *text, NSEvent *event) {
     }
 }
 
-static uint32_t zpui_button_for_event(NSEvent *event) {
-    switch (event.buttonNumber) {
-    case 0:
-        return ZPUI_BUTTON_LEFT;
-    case 1:
-        return ZPUI_BUTTON_RIGHT;
-    default:
-        return ZPUI_BUTTON_OTHER;
-    }
-}
-
-static void zpui_record_mouse_event(uint32_t kind,
-                                    NSEvent *event,
-                                    NSView *view,
-                                    uint32_t button,
+static void zpui_record_mouse_event(uint32_t kind, NSEvent *event, NSView *view, uint32_t button,
                                     uint32_t clickCount) {
     NSPoint point = [view convertPoint:event.locationInWindow fromView:nil];
     zpuiInputState.has_cursor = 1;
@@ -450,15 +503,16 @@ static bool zpui_font_matches_request(CTFontRef font, CFStringRef requestedName)
               zpui_cfstring_matches(familyName, requestedName) ||
               zpui_cfstring_matches(fullName, requestedName);
 
-    if (postscriptName != NULL) CFRelease(postscriptName);
-    if (familyName != NULL) CFRelease(familyName);
-    if (fullName != NULL) CFRelease(fullName);
+    if (postscriptName != NULL)
+        CFRelease(postscriptName);
+    if (familyName != NULL)
+        CFRelease(familyName);
+    if (fullName != NULL)
+        CFRelease(fullName);
     return matched;
 }
 
-static bool zpui_copy_cfstring_utf8(CFStringRef value,
-                                    char *out,
-                                    uint32_t outCapacity,
+static bool zpui_copy_cfstring_utf8(CFStringRef value, char *out, uint32_t outCapacity,
                                     uint32_t *outLen) {
     if (outLen != NULL) {
         *outLen = 0;
@@ -473,14 +527,8 @@ static bool zpui_copy_cfstring_utf8(CFStringRef value,
 
     CFIndex used = 0;
     CFRange range = CFRangeMake(0, CFStringGetLength(value));
-    CFStringGetBytes(value,
-                     range,
-                     kCFStringEncodingUTF8,
-                     0,
-                     false,
-                     (UInt8 *)out,
-                     (CFIndex)outCapacity - 1,
-                     &used);
+    CFStringGetBytes(value, range, kCFStringEncodingUTF8, 0, false, (UInt8 *)out,
+                     (CFIndex)outCapacity - 1, &used);
     out[used] = '\0';
     if (outLen != NULL) {
         *outLen = (uint32_t)used;
@@ -488,10 +536,8 @@ static bool zpui_copy_cfstring_utf8(CFStringRef value,
     return used > 0;
 }
 
-static void zpui_copy_resolved_font_name(CTFontRef font,
-                                         char *resolvedName,
-                                         uint32_t resolvedNameCapacity,
-                                         uint32_t *resolvedNameLen) {
+static void zpui_copy_resolved_font_name(CTFontRef font, char *resolvedName,
+                                         uint32_t resolvedNameCapacity, uint32_t *resolvedNameLen) {
     CFStringRef name = CTFontCopyPostScriptName(font);
     if (name == NULL) {
         name = CTFontCopyFamilyName(font);
@@ -558,8 +604,7 @@ static bool zpui_font_axis_accepts(CFDictionaryRef axis, uint32_t tag, float val
     return requested >= minValue && requested <= maxValue;
 }
 
-static bool zpui_validate_font_variations(CTFontRef font,
-                                          const ZPUIFontVariation *variations,
+static bool zpui_validate_font_variations(CTFontRef font, const ZPUIFontVariation *variations,
                                           uint32_t variationCount) {
     if (variationCount == 0) {
         return true;
@@ -600,10 +645,8 @@ static bool zpui_validate_font_variations(CTFontRef font,
     return ok;
 }
 
-static int zpui_create_requested_font(CFStringRef requestedName,
-                                      CGFloat pixelSize,
-                                      const ZPUIFontVariation *variations,
-                                      uint32_t variationCount,
+static int zpui_create_requested_font(CFStringRef requestedName, CGFloat pixelSize,
+                                      const ZPUIFontVariation *variations, uint32_t variationCount,
                                       CTFontRef *outFont) {
     if (outFont == NULL) {
         return ZPUI_FONT_STATUS_FAILED;
@@ -644,9 +687,7 @@ static int zpui_create_requested_font(CFStringRef requestedName,
         }
 
         CTFontDescriptorRef next = CTFontDescriptorCreateCopyWithVariation(
-            current,
-            axis,
-            (CGFloat)variations[variationIndex].value);
+            current, axis, (CGFloat)variations[variationIndex].value);
         CFRelease(axis);
         CFRelease(current);
         if (next == NULL) {
@@ -689,14 +730,15 @@ int zpui_macos_register_font_file(const char *path) {
 
     NSURL *url = [NSURL fileURLWithPath:fontPath];
     CFErrorRef error = NULL;
-    bool ok = CTFontManagerRegisterFontsForURL((__bridge CFURLRef)url,
-                                               kCTFontManagerScopeProcess,
+    bool ok = CTFontManagerRegisterFontsForURL((__bridge CFURLRef)url, kCTFontManagerScopeProcess,
                                                &error);
     if (!ok && !zpui_font_registration_already_done(error)) {
-        if (error != NULL) CFRelease(error);
+        if (error != NULL)
+            CFRelease(error);
         return ZPUI_FONT_STATUS_FAILED;
     }
-    if (error != NULL) CFRelease(error);
+    if (error != NULL)
+        CFRelease(error);
     return ZPUI_FONT_STATUS_OK;
 }
 
@@ -726,26 +768,21 @@ int zpui_macos_register_font_bytes(const uint8_t *bytes, size_t len) {
 #pragma clang diagnostic pop
     CGFontRelease(font);
     if (!ok && !zpui_font_registration_already_done(error)) {
-        if (error != NULL) CFRelease(error);
+        if (error != NULL)
+            CFRelease(error);
         return ZPUI_FONT_STATUS_FAILED;
     }
-    if (error != NULL) CFRelease(error);
+    if (error != NULL)
+        CFRelease(error);
     return ZPUI_FONT_STATUS_OK;
 }
 
-int zpui_macos_build_ascii_font_atlas(const char *fontName,
-                                      float fontSize,
-                                      const ZPUIFontVariation *variations,
-                                      uint32_t variationCount,
-                                      float scale,
-                                      uint8_t *atlasBytes,
-                                      uint32_t atlasWidth,
-                                      uint32_t atlasHeight,
-                                      ZPUITextFontMetrics *outMetrics,
-                                      ZPUITextGlyphMetric *outGlyphs,
-                                      uint32_t glyphCount,
-                                      char *resolvedName,
-                                      uint32_t resolvedNameCapacity,
+int zpui_macos_build_ascii_font_atlas(const char *fontName, float fontSize,
+                                      const ZPUIFontVariation *variations, uint32_t variationCount,
+                                      float scale, uint8_t *atlasBytes, uint32_t atlasWidth,
+                                      uint32_t atlasHeight, ZPUITextFontMetrics *outMetrics,
+                                      ZPUITextGlyphMetric *outGlyphs, uint32_t glyphCount,
+                                      char *resolvedName, uint32_t resolvedNameCapacity,
                                       uint32_t *resolvedNameLen) {
     if (resolvedNameLen != NULL) {
         *resolvedNameLen = 0;
@@ -788,13 +825,8 @@ int zpui_macos_build_ascii_font_atlas(const char *fontName,
         return ZPUI_FONT_STATUS_FAILED;
     }
 
-    CGContextRef context = CGBitmapContextCreate(atlasBytes,
-                                                 atlasWidth,
-                                                 atlasHeight,
-                                                 8,
-                                                 atlasWidth,
-                                                 colorSpace,
-                                                 (CGBitmapInfo)kCGImageAlphaOnly);
+    CGContextRef context = CGBitmapContextCreate(atlasBytes, atlasWidth, atlasHeight, 8, atlasWidth,
+                                                 colorSpace, (CGBitmapInfo)kCGImageAlphaOnly);
     CGColorSpaceRelease(colorSpace);
     if (context == NULL) {
         CFRelease(font);
@@ -885,9 +917,9 @@ int zpui_macos_build_ascii_font_atlas(const char *fontName,
         metric->offset_y = (float)((ascent - glyphMaxY - (CGFloat)pad) / (CGFloat)scale);
         metric->flags |= ZPUI_TEXT_GLYPH_VISIBLE;
 
-        CGPoint point = CGPointMake((CGFloat)penX + (CGFloat)pad - glyphMinX,
-                                    (CGFloat)atlasHeight - ((CGFloat)penY + (CGFloat)pad) -
-                                        glyphMaxY);
+        CGPoint point =
+            CGPointMake((CGFloat)penX + (CGFloat)pad - glyphMinX,
+                        (CGFloat)atlasHeight - ((CGFloat)penY + (CGFloat)pad) - glyphMaxY);
         CTFontDrawGlyphs(font, &glyph, &point, 1, context);
 
         penX += tileWidth + pad;
@@ -935,12 +967,14 @@ id<MTLLibrary> zpui_platform_create_shader_library(id<MTLDevice> device) {
 
 static id<ZPUIWindowSurface> zpuiActiveWindowSurface = nil;
 
-void zpui_macos_request_redraw(void) {
-    [zpuiActiveWindowSurface requestFrame];
-}
+void zpui_macos_request_redraw(void) { [zpuiActiveWindowSurface requestFrame]; }
 
 @interface ZPUIWindow : NSWindow <NSWindowDelegate>
-@property(nonatomic, weak) id<ZPUIWindowSurface> metalView;
+@property(nonatomic, assign) id<ZPUIWindowSurface> metalView;
+@property(nonatomic) BOOL zpuiHasTrafficLightPosition;
+@property(nonatomic) NSPoint zpuiTrafficLightPosition;
+@property(nonatomic) BOOL zpuiTitlebarTransparent;
+- (void)zpuiApplyTrafficLightPosition;
 @end
 
 @implementation ZPUIWindow
@@ -956,6 +990,7 @@ void zpui_macos_request_redraw(void) {
 - (void)windowDidResize:(NSNotification *)notification {
     (void)notification;
     zpuiInputState.window |= ZPUI_WINDOW_RESIZED;
+    [self zpuiApplyTrafficLightPosition];
     [self.metalView requestFrame];
 }
 
@@ -973,21 +1008,72 @@ void zpui_macos_request_redraw(void) {
 
 - (void)windowDidChangeScreen:(NSNotification *)notification {
     (void)notification;
+    [self zpuiApplyTrafficLightPosition];
     [self.metalView requestFrame];
 }
 
 - (void)windowDidChangeOcclusionState:(NSNotification *)notification {
     (void)notification;
+    id<ZPUIWindowSurface> metalView = self.metalView;
     if ((self.occlusionState & NSWindowOcclusionStateVisible) != 0) {
-        [self.metalView requestFrame];
+        [self zpuiApplyTrafficLightPosition];
+        [metalView requestFrame];
     } else {
-        [self.metalView stopDisplayLink];
+        [metalView stopDisplayLink];
     }
 }
 
 - (void)windowWillClose:(NSNotification *)notification {
     (void)notification;
     [self.metalView stopDisplayLink];
+}
+
+- (void)windowWillEnterFullScreen:(NSNotification *)notification {
+    (void)notification;
+    NSOperatingSystemVersion version = {15, 3, 0};
+    if (self.zpuiTitlebarTransparent &&
+        [[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:version]) {
+        self.titlebarAppearsTransparent = NO;
+    }
+}
+
+- (void)windowWillExitFullScreen:(NSNotification *)notification {
+    (void)notification;
+    NSOperatingSystemVersion version = {15, 3, 0};
+    if (self.zpuiTitlebarTransparent &&
+        [[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:version]) {
+        self.titlebarAppearsTransparent = YES;
+    }
+}
+
+- (void)zpuiApplyTrafficLightPosition {
+    if (!self.zpuiHasTrafficLightPosition ||
+        ((self.styleMask & NSWindowStyleMaskFullScreen) != 0)) {
+        return;
+    }
+
+    NSButton *closeButton = [self standardWindowButton:NSWindowCloseButton];
+    NSButton *minButton = [self standardWindowButton:NSWindowMiniaturizeButton];
+    NSButton *zoomButton = [self standardWindowButton:NSWindowZoomButton];
+    if (closeButton == nil || minButton == nil || zoomButton == nil ||
+        closeButton.superview == nil) {
+        return;
+    }
+
+    NSRect closeFrame = closeButton.frame;
+    NSRect minFrame = minButton.frame;
+    NSRect zoomFrame = zoomButton.frame;
+    const CGFloat titlebarHeight = NSHeight(closeButton.superview.bounds);
+    const CGFloat y = titlebarHeight - self.zpuiTrafficLightPosition.y - NSHeight(closeFrame);
+    const CGFloat spacing = NSMinX(minFrame) - NSMinX(closeFrame);
+
+    closeFrame.origin = NSMakePoint(self.zpuiTrafficLightPosition.x, y);
+    minFrame.origin = NSMakePoint(self.zpuiTrafficLightPosition.x + spacing, y);
+    zoomFrame.origin = NSMakePoint(self.zpuiTrafficLightPosition.x + spacing * 2.0, y);
+
+    closeButton.frame = closeFrame;
+    minButton.frame = minFrame;
+    zoomButton.frame = zoomFrame;
 }
 
 @end
@@ -1007,7 +1093,7 @@ void zpui_macos_request_redraw(void) {
 static ZPUIAppDelegate *zpuiAppDelegate = nil;
 
 @interface ZPUIRenderer : NSObject
-- (instancetype)initWithDevice:(id<MTLDevice>)device;
+- (instancetype)initWithDevice:(id<MTLDevice>)device layerOpaque:(BOOL)layerOpaque;
 - (CAMetalLayer *)layer;
 - (void)resizeToDrawableSize:(CGSize)drawableSize scale:(CGFloat)scale;
 - (BOOL)drawFrame;
@@ -1018,10 +1104,11 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     ZPUISurface *_surface;
 }
 
-- (instancetype)initWithDevice:(id<MTLDevice>)device {
+- (instancetype)initWithDevice:(id<MTLDevice>)device layerOpaque:(BOOL)layerOpaque {
     self = [super init];
     if (self) {
-        int surfaceStatus = zpui_surface_create(device, &_surface);
+        int surfaceStatus =
+            zpui_surface_create_with_options(device, layerOpaque ? 1u : 0u, &_surface);
         if (surfaceStatus != 0 || _surface == NULL) {
             fprintf(stderr, "ZPUI: failed to create surface in Zig: %s (%d)\n",
                     zpui_platform_status_name(surfaceStatus), surfaceStatus);
@@ -1077,13 +1164,18 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
 - (void)dealloc {
     zpui_surface_destroy(_surface);
     _surface = NULL;
+#if !__has_feature(objc_arc)
+    [super dealloc];
+#endif
 }
 
 @end
 
 @interface ZPUIMetalView : NSView <ZPUIWindowSurface>
 @property(nonatomic, strong, readonly) ZPUIRenderer *renderer;
-- (instancetype)initWithFrame:(NSRect)frame device:(id<MTLDevice>)device;
+- (instancetype)initWithFrame:(NSRect)frame
+                       device:(id<MTLDevice>)device
+                  layerOpaque:(BOOL)layerOpaque;
 - (void)requestFrame;
 - (void)setContinuousFrames:(BOOL)enabled;
 - (void)startDisplayLink;
@@ -1097,10 +1189,12 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
     BOOL _continuousFrames;
 }
 
-- (instancetype)initWithFrame:(NSRect)frame device:(id<MTLDevice>)device {
+- (instancetype)initWithFrame:(NSRect)frame
+                       device:(id<MTLDevice>)device
+                  layerOpaque:(BOOL)layerOpaque {
     self = [super initWithFrame:frame];
     if (self) {
-        _renderer = [[ZPUIRenderer alloc] initWithDevice:device];
+        _renderer = [[ZPUIRenderer alloc] initWithDevice:device layerOpaque:layerOpaque];
         if (_renderer == nil) {
             return nil;
         }
@@ -1171,36 +1265,42 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
 
 - (void)mouseDown:(NSEvent *)event {
     zpuiInputState.buttons |= ZPUI_BUTTON_LEFT;
-    zpui_record_mouse_event(ZPUI_MOUSE_DOWN, event, self, ZPUI_BUTTON_LEFT, (uint32_t)event.clickCount);
+    zpui_record_mouse_event(ZPUI_MOUSE_DOWN, event, self, ZPUI_BUTTON_LEFT,
+                            (uint32_t)event.clickCount);
     [self requestFrame];
 }
 
 - (void)rightMouseDown:(NSEvent *)event {
     zpuiInputState.buttons |= ZPUI_BUTTON_RIGHT;
-    zpui_record_mouse_event(ZPUI_MOUSE_DOWN, event, self, ZPUI_BUTTON_RIGHT, (uint32_t)event.clickCount);
+    zpui_record_mouse_event(ZPUI_MOUSE_DOWN, event, self, ZPUI_BUTTON_RIGHT,
+                            (uint32_t)event.clickCount);
     [self requestFrame];
 }
 
 - (void)otherMouseDown:(NSEvent *)event {
     zpuiInputState.buttons |= ZPUI_BUTTON_OTHER;
-    zpui_record_mouse_event(ZPUI_MOUSE_DOWN, event, self, ZPUI_BUTTON_OTHER, (uint32_t)event.clickCount);
+    zpui_record_mouse_event(ZPUI_MOUSE_DOWN, event, self, ZPUI_BUTTON_OTHER,
+                            (uint32_t)event.clickCount);
     [self requestFrame];
 }
 
 - (void)mouseUp:(NSEvent *)event {
-    zpui_record_mouse_event(ZPUI_MOUSE_UP, event, self, ZPUI_BUTTON_LEFT, (uint32_t)event.clickCount);
+    zpui_record_mouse_event(ZPUI_MOUSE_UP, event, self, ZPUI_BUTTON_LEFT,
+                            (uint32_t)event.clickCount);
     zpuiInputState.buttons &= ~ZPUI_BUTTON_LEFT;
     [self requestFrame];
 }
 
 - (void)rightMouseUp:(NSEvent *)event {
-    zpui_record_mouse_event(ZPUI_MOUSE_UP, event, self, ZPUI_BUTTON_RIGHT, (uint32_t)event.clickCount);
+    zpui_record_mouse_event(ZPUI_MOUSE_UP, event, self, ZPUI_BUTTON_RIGHT,
+                            (uint32_t)event.clickCount);
     zpuiInputState.buttons &= ~ZPUI_BUTTON_RIGHT;
     [self requestFrame];
 }
 
 - (void)otherMouseUp:(NSEvent *)event {
-    zpui_record_mouse_event(ZPUI_MOUSE_UP, event, self, ZPUI_BUTTON_OTHER, (uint32_t)event.clickCount);
+    zpui_record_mouse_event(ZPUI_MOUSE_UP, event, self, ZPUI_BUTTON_OTHER,
+                            (uint32_t)event.clickCount);
     zpuiInputState.buttons &= ~ZPUI_BUTTON_OTHER;
     [self requestFrame];
 }
@@ -1333,6 +1433,9 @@ static ZPUIAppDelegate *zpuiAppDelegate = nil;
         zpuiActiveWindowSurface = nil;
     }
     [self stopDisplayLink];
+#if !__has_feature(objc_arc)
+    [super dealloc];
+#endif
 }
 
 @end
@@ -1351,9 +1454,134 @@ static void zpui_install_menu(void) {
     [appMenuItem setSubmenu:appMenu];
 }
 
-int zpui_macos_init_window(const char *title, double width, double height) {
+static NSWindowStyleMask zpui_window_style_mask(ZPUIWindowChrome chrome) {
+    NSWindowStyleMask style = (NSWindowStyleMask)0;
+    if ((chrome.flags & ZPUI_WINDOW_TITLED) != 0) {
+        style |= NSWindowStyleMaskTitled;
+    }
+    if ((chrome.flags & ZPUI_WINDOW_CLOSABLE) != 0) {
+        style |= NSWindowStyleMaskClosable;
+    }
+    if ((chrome.flags & ZPUI_WINDOW_MINIATURIZABLE) != 0) {
+        style |= NSWindowStyleMaskMiniaturizable;
+    }
+    if ((chrome.flags & ZPUI_WINDOW_RESIZABLE) != 0) {
+        style |= NSWindowStyleMaskResizable;
+    }
+    if ((chrome.flags & ZPUI_WINDOW_FULL_SIZE_CONTENT) != 0) {
+        style |= NSWindowStyleMaskFullSizeContentView;
+    }
+    return style;
+}
+
+static BOOL zpui_window_layer_opaque(ZPUIWindowChrome chrome) {
+    return chrome.background == ZPUI_WINDOW_BACKGROUND_OPAQUE ? YES : NO;
+}
+
+static NSWindowToolbarStyle zpui_toolbar_style(uint32_t style) {
+    switch (style) {
+    case ZPUI_WINDOW_TOOLBAR_STYLE_EXPANDED:
+        return NSWindowToolbarStyleExpanded;
+    case ZPUI_WINDOW_TOOLBAR_STYLE_PREFERENCE:
+        return NSWindowToolbarStylePreference;
+    case ZPUI_WINDOW_TOOLBAR_STYLE_UNIFIED:
+        return NSWindowToolbarStyleUnified;
+    case ZPUI_WINDOW_TOOLBAR_STYLE_UNIFIED_COMPACT:
+        return NSWindowToolbarStyleUnifiedCompact;
+    default:
+        return NSWindowToolbarStyleAutomatic;
+    }
+}
+
+static NSTitlebarSeparatorStyle zpui_titlebar_separator_style(uint32_t style) {
+    switch (style) {
+    case ZPUI_WINDOW_TITLEBAR_SEPARATOR_NONE:
+        return NSTitlebarSeparatorStyleNone;
+    case ZPUI_WINDOW_TITLEBAR_SEPARATOR_LINE:
+        return NSTitlebarSeparatorStyleLine;
+    case ZPUI_WINDOW_TITLEBAR_SEPARATOR_SHADOW:
+        return NSTitlebarSeparatorStyleShadow;
+    default:
+        return NSTitlebarSeparatorStyleAutomatic;
+    }
+}
+
+static void zpui_apply_window_appearance(NSWindow *window, uint32_t appearance) {
+    NSString *name = nil;
+    switch (appearance) {
+    case ZPUI_WINDOW_APPEARANCE_AQUA:
+        name = NSAppearanceNameAqua;
+        break;
+    case ZPUI_WINDOW_APPEARANCE_DARK_AQUA:
+        name = NSAppearanceNameDarkAqua;
+        break;
+    case ZPUI_WINDOW_APPEARANCE_VIBRANT_LIGHT:
+        name = NSAppearanceNameVibrantLight;
+        break;
+    case ZPUI_WINDOW_APPEARANCE_VIBRANT_DARK:
+        name = NSAppearanceNameVibrantDark;
+        break;
+    default:
+        window.appearance = nil;
+        return;
+    }
+    window.appearance = [NSAppearance appearanceNamed:name];
+}
+
+static void zpui_apply_window_background(NSWindow *window, ZPUIWindowChrome chrome) {
+    const BOOL opaque = zpui_window_layer_opaque(chrome);
+    window.opaque = opaque;
+    window.backgroundColor = opaque
+                                 ? [NSColor colorWithSRGBRed:0.0 green:0.0 blue:0.0 alpha:1.0]
+                                 : [NSColor colorWithSRGBRed:0.0 green:0.0 blue:0.0 alpha:0.0001];
+
+    if (chrome.background != ZPUI_WINDOW_BACKGROUND_BLURRED) {
+        return;
+    }
+
+    NSVisualEffectView *blurView =
+        [[NSVisualEffectView alloc] initWithFrame:window.contentView.bounds];
+    blurView.autoresizingMask =
+        (NSAutoresizingMaskOptions)(NSViewWidthSizable | NSViewHeightSizable);
+    blurView.material = NSVisualEffectMaterialWindowBackground;
+    blurView.blendingMode = NSVisualEffectBlendingModeBehindWindow;
+    blurView.state = NSVisualEffectStateActive;
+    [window.contentView addSubview:blurView positioned:NSWindowBelow relativeTo:nil];
+}
+
+static void zpui_apply_window_chrome(ZPUIWindow *window, ZPUIWindowChrome chrome) {
+    window.movable = (chrome.flags & ZPUI_WINDOW_MOVABLE) != 0;
+    window.movableByWindowBackground = (chrome.flags & ZPUI_WINDOW_MOVABLE_BY_BACKGROUND) != 0;
+    window.hasShadow = (chrome.flags & ZPUI_WINDOW_HAS_SHADOW) != 0;
+
+    if ((chrome.flags & ZPUI_WINDOW_TITLEBAR_TRANSPARENT) != 0) {
+        window.zpuiTitlebarTransparent = YES;
+        window.titlebarAppearsTransparent = YES;
+    }
+    window.titleVisibility = (chrome.flags & ZPUI_WINDOW_TITLE_VISIBLE) != 0 ? NSWindowTitleVisible
+                                                                             : NSWindowTitleHidden;
+
+    if (@available(macOS 11.0, *)) {
+        window.toolbarStyle = zpui_toolbar_style(chrome.toolbar_style);
+        window.titlebarSeparatorStyle =
+            zpui_titlebar_separator_style(chrome.titlebar_separator_style);
+    }
+
+    zpui_apply_window_appearance(window, chrome.appearance);
+    zpui_apply_window_background(window, chrome);
+
+    if ((chrome.flags & ZPUI_WINDOW_TRAFFIC_LIGHT_POSITION) != 0) {
+        window.zpuiHasTrafficLightPosition = YES;
+        window.zpuiTrafficLightPosition =
+            NSMakePoint(chrome.traffic_light_x, chrome.traffic_light_y);
+    }
+}
+
+int zpui_macos_init_window(const char *title, double width, double height,
+                           ZPUIWindowChrome chrome) {
     @autoreleasepool {
-        if (title == NULL || title[0] == '\0' || width <= 0.0 || height <= 0.0) {
+        if (title == NULL || title[0] == '\0' || width <= 0.0 || height <= 0.0 ||
+            !isfinite(width) || !isfinite(height)) {
             return 1;
         }
 
@@ -1375,9 +1603,7 @@ int zpui_macos_init_window(const char *title, double width, double height) {
         }
 
         const NSRect frame = NSMakeRect(0, 0, width, height);
-        const NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                                        NSWindowStyleMaskMiniaturizable |
-                                        NSWindowStyleMaskResizable;
+        const NSWindowStyleMask style = zpui_window_style_mask(chrome);
 
         ZPUIWindow *window = [[ZPUIWindow alloc] initWithContentRect:frame
                                                            styleMask:style
@@ -1390,10 +1616,13 @@ int zpui_macos_init_window(const char *title, double width, double height) {
         window.title = windowTitle;
         window.releasedWhenClosed = NO;
         window.acceptsMouseMovedEvents = YES;
+        zpui_apply_window_chrome(window, chrome);
         [window center];
 
-        ZPUIMetalView *metalView = [[ZPUIMetalView alloc] initWithFrame:window.contentView.bounds
-                                                                 device:device];
+        ZPUIMetalView *metalView =
+            [[ZPUIMetalView alloc] initWithFrame:window.contentView.bounds
+                                          device:device
+                                     layerOpaque:zpui_window_layer_opaque(chrome)];
         if (metalView == nil) {
             return 1;
         }
@@ -1404,6 +1633,7 @@ int zpui_macos_init_window(const char *title, double width, double height) {
         window.delegate = window;
         [window makeFirstResponder:metalView];
         [window makeKeyAndOrderFront:nil];
+        [window zpuiApplyTrafficLightPosition];
         [metalView requestFrame];
 
         [NSApp activateIgnoringOtherApps:YES];
