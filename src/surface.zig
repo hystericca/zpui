@@ -299,8 +299,8 @@ pub const Surface = struct {
     frame_event: mtl.resource.OwnedSharedEvent,
     caps: mtl.runtime.DeviceCapabilities,
     current_frame_index: u64 = max_frames_in_flight,
-    // CAMetalLayer exposes drawableSize as a CGSize in pixel coordinate space.
-    // Keep that API shape here; integer Metal scissors are derived at encoding.
+    // CAMetalLayer.drawableSize is a CGSize, even though it means pixels
+    // Keep Apple's shape here; integer Metal scissors are derived at encoding
     drawable_size_pixels: mtl.abi.Size2D = .{ .width = 0, .height = 0 },
     scale: mtl.abi.CGFloat = 1.0,
     resize_generation: u64 = 0,
@@ -1289,8 +1289,8 @@ fn uploadMaskAtlas(texture: mtl.resource.Texture, atlas: *const mask.AtlasStorag
 fn validateClipRect(clip: scene.ClipRect, frame_size_points: [2]f32) Error!void {
     if (clip.width == 0 or clip.height == 0) return Error.InvalidClipRect;
 
-    // Scene clips are integer points with exclusive max edges. Validate against
-    // the same outward-rounded extent produced by Frame.clipRectFromPoints.
+    // Scene clips are integer points with exclusive max edges
+    // Validate against the same outward-rounded extent produced by Frame
     const frame_width = try pointExtent(frame_size_points[0]);
     const frame_height = try pointExtent(frame_size_points[1]);
     if (clip.x > frame_width or clip.width > frame_width - clip.x) return Error.InvalidClipRect;

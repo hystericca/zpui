@@ -90,7 +90,7 @@ pub const InputSnapshot = struct {
     window: u32 = 0,
 };
 
-pub const Begin = struct {
+pub const FrameBegin = struct {
     frame_size_points: [2]f32,
     scale: f32 = 1.0,
     clear_color: scene.ClearColor = .{ 0.0, 0.0, 0.0, 1.0 },
@@ -104,6 +104,7 @@ pub const DrawOptions = struct {
     layer: u32 = scene.layer_content,
 };
 
+/// Draw commands for one clip/layer
 pub const Draw = struct {
     frame: *Frame,
     clip: u32,
@@ -148,9 +149,15 @@ pub const Storage = struct {
     hit_state: ui.hit.HitState = .{},
 };
 
+/// Frame is the per-frame builder plus scratch memory
+/// Normal drawing should go through Draw
 pub const Frame = struct {
+    pub const Begin = FrameBegin;
+
     storage: *Storage,
     frame_size_points: [2]f32,
+    /// Copied from the surface at frame begin
+    /// Used for helpers like hairline() and snapping
     scale: f32,
     input: InputSnapshot,
     font: ?*const text.Font,
@@ -242,6 +249,7 @@ pub const Frame = struct {
     }
 
     pub fn pushFillLayer(frame: *Frame, rect: ui.layout.Rect, color: ui.style.Color, clip_index: u32, layer: u32) Error!void {
+        try frame.flushQuads();
         try frame.beginLayerBatch(clip_index, layer);
         try frame.pushFill(rect, color, clip_index);
         try frame.endBatch();
@@ -252,6 +260,7 @@ pub const Frame = struct {
     }
 
     pub fn pushStyledRectLayer(frame: *Frame, rect: ui.layout.Rect, style: ui.style.Style, clip_index: u32, layer: u32) Error!void {
+        try frame.flushQuads();
         try frame.beginLayerBatch(clip_index, layer);
         try frame.pushStyledRect(rect, style, clip_index);
         try frame.endBatch();
@@ -516,7 +525,6 @@ pub const Frame = struct {
         out.text_batches = frame.textBatches();
         out.masks = frame.masks();
         out.mask_batches = frame.maskBatches();
-        out.font = frame.font;
         return out;
     }
 
@@ -540,8 +548,8 @@ fn sceneRectFromPoints(rect: ui.layout.Rect) scene.Rect {
 fn clipRectFromPoints(rect: ui.layout.Rect) scene.SceneBuildError!scene.ClipRect {
     if (!validRect(rect)) return scene.SceneBuildError.InvalidClip;
 
-    // Clip max edges are exclusive. Round out in point space so fractional
-    // layout never loses visible coverage before the physical scissor clamp.
+    // Floor the min edge and ceil the max edge so fractional layouts don't
+    // lose edge pixels
     const x0 = @floor(rect.x);
     const y0 = @floor(rect.y);
     const x1 = @ceil(rect.x + rect.width);
@@ -816,7 +824,6 @@ test "frame pushes text into a caller-owned glyph stream" {
     try std.testing.expectEqual(scene.layer_content, frame.textBatches()[0].layer);
     try std.testing.expectEqual(@as(usize, 2), out.glyphs.len);
     try std.testing.expectEqual(@as(usize, 1), out.text_batches.len);
-    try std.testing.expectEqual(@as(?*const text.Font, &font), out.font);
     try std.testing.expectEqual(ui.layout.Rect.init(12.0, 18.0, 5.0, 7.0), out.glyphs[0].rect);
     try std.testing.expectEqual(ui.layout.Rect.init(18.0, 18.0, 5.0, 7.0), out.glyphs[1].rect);
 
@@ -1067,6 +1074,23 @@ test "frame exposes layer helpers for editor composition" {
     try std.testing.expectEqual(scene.layer_foreground, out.batches[0].layer);
     try std.testing.expectEqual(scene.layer_overlay, out.text_batches[0].layer);
     try std.testing.expectEqual(scene.layer_surface, out.mask_batches[0].layer);
+}
+
+test "frame layered helpers flush open draw batches" {
+    var storage: Storage = .{};
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
+    const clip = try frame.pushFrameClip();
+    var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_content });
+
+    try draw.fill(ui.layout.Rect.init(0.0, 0.0, 10.0, 10.0), ui.style.Color.rgb(1.0, 1.0, 1.0));
+    try frame.pushFillLayer(ui.layout.Rect.init(12.0, 0.0, 10.0, 10.0), .{}, clip, scene.layer_foreground);
+    const out = try frame.finish();
+
+    try std.testing.expectEqual(@as(usize, 2), out.batches.len);
+    try std.testing.expectEqual(scene.layer_content, out.batches[0].layer);
+    try std.testing.expectEqual(scene.layer_foreground, out.batches[1].layer);
+    try std.testing.expectEqual(@as(u32, 0), out.batches[0].order);
+    try std.testing.expectEqual(@as(u32, 1), out.batches[1].order);
 }
 
 test "frame pushes masks into a caller-owned mask stream" {

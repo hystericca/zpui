@@ -226,6 +226,8 @@ const NativeDrawContext = struct {
 };
 
 pub const DrawContext = opaque {
+    pub const RenderMetrics = surface.RenderMetrics;
+
     fn native(ctx: *DrawContext) *NativeDrawContext {
         return @ptrCast(@alignCast(ctx));
     }
@@ -311,7 +313,7 @@ pub const DrawContext = opaque {
         });
     }
 
-    pub fn renderMetrics(ctx: *DrawContext) surface.RenderMetrics {
+    pub fn renderMetrics(ctx: *DrawContext) RenderMetrics {
         return ctx.native().surface.renderMetrics();
     }
 

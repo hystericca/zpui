@@ -68,8 +68,8 @@ pub const GpuQuad = extern struct {
     border_color: Color,
     radius: Radius,
     border_width: f32,
-    // Keep GPU-shared padding as scalars. Metal vector3 types have 16-byte
-    // alignment, which does not match a packed host [3]f32 tail.
+    // Keep these as scalars; Metal vector3 types have 16-byte alignment,
+    // which doesn't match a packed host [3]f32 tail
     reserved: [3]f32 = .{ 0.0, 0.0, 0.0 },
 };
 
@@ -123,7 +123,6 @@ pub const Scene = struct {
     text_batches: []const TextBatch,
     masks: []const mask.Instance,
     mask_batches: []const MaskBatch,
-    font: ?*const text.Font,
 };
 
 pub const SceneStorage = struct {
@@ -132,10 +131,9 @@ pub const SceneStorage = struct {
     clips: [max_clips]ClipRect = undefined,
 };
 
-// GPU frame buffers share a 16-byte header: frame size in logical points,
-// stream item count, then backing scale. The quad shader uses scale for SDF
-// antialiasing today; text and mask keep the same header so every stream is
-// compiled from one surface-owned coordinate contract.
+// GPU frame buffers start with the same 16-byte header: frame size,
+// stream item count, backing scale; the quad shader uses scale for SDF AA
+// TODO: decide whether text/mask should keep the common header
 pub const FrameData = extern struct {
     frame_size_points: [2]f32,
     quad_count: u32,
@@ -338,7 +336,6 @@ pub const SceneBuilder = struct {
             .text_batches = &.{},
             .masks = &.{},
             .mask_batches = &.{},
-            .font = null,
         };
     }
 };
@@ -622,7 +619,6 @@ test "scene compilers reject invalid backing scale" {
         .text_batches = &.{},
         .masks = &.{},
         .mask_batches = &.{},
-        .font = null,
     };
     var frame_data: FrameData = undefined;
     var text_frame_data: TextFrameData = undefined;
@@ -760,7 +756,6 @@ test "text compiler emits compact glyph frame data" {
         }},
         .masks = &.{},
         .mask_batches = &.{},
-        .font = null,
     };
 
     var frame_data: TextFrameData = undefined;
@@ -801,7 +796,6 @@ test "text compiler rejects malformed text batches" {
         .text_batches = batches[0..],
         .masks = &.{},
         .mask_batches = &.{},
-        .font = null,
     };
 
     var frame_data: TextFrameData = undefined;
@@ -829,7 +823,6 @@ test "text compiler rejects malformed glyph payloads" {
         .text_batches = batches[0..],
         .masks = &.{},
         .mask_batches = &.{},
-        .font = null,
     };
     var frame_data: TextFrameData = undefined;
 
@@ -880,7 +873,6 @@ test "mask compiler emits compact mask frame data" {
             .clip_index = 0,
             .layer = layer_overlay,
         }},
-        .font = null,
     };
 
     var frame_data: MaskFrameData = undefined;
@@ -921,7 +913,6 @@ test "mask compiler rejects malformed mask batches" {
         .text_batches = &.{},
         .masks = masks[0..],
         .mask_batches = batches[0..],
-        .font = null,
     };
 
     var frame_data: MaskFrameData = undefined;
@@ -948,7 +939,6 @@ test "mask compiler rejects malformed mask payloads" {
         .text_batches = &.{},
         .masks = masks[0..],
         .mask_batches = &.{.{ .vertex_start = 0, .vertex_count = vertices_per_mask, .clip_index = 0 }},
-        .font = null,
     };
     var frame_data: MaskFrameData = undefined;
 
@@ -1036,7 +1026,6 @@ test "scene compiler rejects malformed scenes" {
         .text_batches = &.{},
         .masks = &.{},
         .mask_batches = &.{},
-        .font = null,
     };
 
     var frame_data: FrameData = undefined;
