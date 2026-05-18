@@ -8,7 +8,6 @@ pub const surface = @import("surface.zig");
 pub const frame = core.frame;
 pub const mask = core.mask;
 pub const scene = core.scene;
-pub const render = scene;
 pub const text = core.text;
 pub const ui = core.ui;
 pub const PlatformError = platform.macos.Error;

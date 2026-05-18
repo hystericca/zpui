@@ -1,7 +1,6 @@
 pub const frame = @import("frame.zig");
 pub const mask = @import("mask.zig");
 pub const scene = @import("scene.zig");
-pub const render = scene;
 pub const text = @import("text.zig");
 pub const ui = @import("ui.zig");
 
