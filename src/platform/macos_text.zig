@@ -7,6 +7,7 @@ pub const Error = error{
     FontVariationUnavailable,
     FontRegistrationFailed,
     InvalidFontData,
+    FontCapacityExceeded,
     InvalidFontHandle,
     InvalidUtf8,
     LineGlyphCapacityExceeded,
@@ -16,13 +17,13 @@ pub const Error = error{
 
 pub const PlatformFont = extern struct {
     descriptor: ?*anyopaque = null,
-    postscript_name: [text.max_resolved_font_name_len + 1]u8 = [_]u8{0} ** (text.max_resolved_font_name_len + 1),
+    postscript_name: [text.max_resolved_font_name_len + 1]u8 = @splat(0),
     postscript_name_len: u32 = 0,
-    family_name: [text.max_resolved_font_name_len + 1]u8 = [_]u8{0} ** (text.max_resolved_font_name_len + 1),
+    family_name: [text.max_resolved_font_name_len + 1]u8 = @splat(0),
     family_name_len: u32 = 0,
-    display_name: [text.max_resolved_font_name_len + 1]u8 = [_]u8{0} ** (text.max_resolved_font_name_len + 1),
+    display_name: [text.max_resolved_font_name_len + 1]u8 = @splat(0),
     display_name_len: u32 = 0,
-    axes: [text.max_font_variations]text.FontAxis = [_]text.FontAxis{.{}} ** text.max_font_variations,
+    axes: [text.max_font_variations]text.FontAxis = @splat(.{}),
     axis_count: u32 = 0,
 };
 
@@ -41,6 +42,7 @@ pub const RawShapedGlyph = extern struct {
     font_generation: u32 = 0,
     glyph_id: u32 = 0,
     byte_index: u32 = 0,
+    fallback_index: u32 = text.no_fallback_index,
     x: f32 = 0.0,
     y: f32 = 0.0,
     size: f32 = 0.0,
@@ -56,6 +58,7 @@ pub const RawLineMetrics = extern struct {
     baseline_offset: f32 = 0.0,
     bytes_len: u32 = 0,
     glyph_count: u32 = 0,
+    fallback_count: u32 = 0,
 };
 
 pub const GlyphRaster = extern struct {
@@ -114,6 +117,8 @@ extern fn zpui_macos_shape_line(
     run_count: u32,
     out_glyphs: [*]RawShapedGlyph,
     glyph_capacity: u32,
+    out_fallback_fonts: [*]PlatformFont,
+    fallback_capacity: u32,
     out_metrics: *RawLineMetrics,
 ) c_int;
 extern fn zpui_macos_rasterize_glyph(
@@ -192,13 +197,15 @@ pub fn loadFontBytes(bytes: []const u8, options: text.FontLoadOptions) Error!Pla
     return font;
 }
 
-pub fn shapeLine(runs: []const RawTextRun, out_glyphs: []RawShapedGlyph) Error!RawLineMetrics {
+pub fn shapeLine(runs: []const RawTextRun, out_glyphs: []RawShapedGlyph, out_fallback_fonts: []PlatformFont) Error!RawLineMetrics {
     var metrics: RawLineMetrics = .{};
     const status = zpui_macos_shape_line(
         runs.ptr,
         @intCast(runs.len),
         out_glyphs.ptr,
         @intCast(out_glyphs.len),
+        out_fallback_fonts.ptr,
+        @intCast(out_fallback_fonts.len),
         &metrics,
     );
     try shapeStatus(status);
@@ -245,6 +252,7 @@ fn shapeStatus(status: c_int) Error!void {
         5 => Error.InvalidUtf8,
         6 => Error.InvalidFontHandle,
         7 => Error.LineGlyphCapacityExceeded,
+        9 => Error.FontCapacityExceeded,
         else => Error.ShapingFailed,
     };
 }
@@ -410,7 +418,11 @@ test "macos text shapes utf8 lines and rasterizes glyph coverage" {
         .color = .{ 0.8, 0.9, 1.0, 1.0 },
     }};
     var glyphs: [64]RawShapedGlyph = undefined;
-    const metrics = try shapeLine(runs[0..], glyphs[0..]);
+    var fallback_fonts: [text.max_fallback_fonts]PlatformFont = @splat(.{});
+    const metrics = try shapeLine(runs[0..], glyphs[0..], fallback_fonts[0..]);
+    defer {
+        for (fallback_fonts[0..metrics.fallback_count]) |*fallback| releaseFont(fallback);
+    }
 
     try std.testing.expect(metrics.glyph_count > 0);
     try std.testing.expect(metrics.line_height > 0.0);
@@ -434,7 +446,42 @@ test "macos text shapes utf8 lines and rasterizes glyph coverage" {
         .size = 15.0,
         .color = .{ 1.0, 1.0, 1.0, 1.0 },
     }};
-    try std.testing.expectError(Error.InvalidUtf8, shapeLine(bad_runs[0..], glyphs[0..]));
+    try std.testing.expectError(Error.InvalidUtf8, shapeLine(bad_runs[0..], glyphs[0..], fallback_fonts[0..]));
+}
+
+test "macos text reports CoreText fallback font descriptors" {
+    var font = try loadSystemFont("Menlo", .{});
+    defer releaseFont(&font);
+
+    const sample = "\u{6f22}\u{5b57}";
+    const runs = [_]RawTextRun{.{
+        .bytes = sample.ptr,
+        .len = sample.len,
+        .descriptor = font.descriptor,
+        .font_index = 0,
+        .font_generation = 1,
+        .size = 15.0,
+        .color = .{ 1.0, 1.0, 1.0, 1.0 },
+    }};
+    var glyphs: [64]RawShapedGlyph = undefined;
+    var fallback_fonts: [text.max_fallback_fonts]PlatformFont = @splat(.{});
+    const metrics = try shapeLine(runs[0..], glyphs[0..], fallback_fonts[0..]);
+    defer {
+        for (fallback_fonts[0..metrics.fallback_count]) |*fallback| releaseFont(fallback);
+    }
+
+    try std.testing.expect(metrics.glyph_count > 0);
+    try std.testing.expect(metrics.fallback_count > 0);
+    var saw_fallback = false;
+    for (glyphs[0..metrics.glyph_count]) |glyph| {
+        if (glyph.fallback_index != text.no_fallback_index) {
+            try std.testing.expect(glyph.fallback_index < metrics.fallback_count);
+            saw_fallback = true;
+        }
+    }
+    try std.testing.expect(saw_fallback);
+    try std.testing.expect(fallback_fonts[0].descriptor != null);
+    try std.testing.expect(fallback_fonts[0].postscript_name_len > 0);
 }
 
 fn expectGlyphRectHasCoverage(font: *const text.Font, atlas: *const text.AtlasStorage, byte: u8) !void {

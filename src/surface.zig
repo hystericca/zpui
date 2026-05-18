@@ -150,6 +150,8 @@ pub const Status = enum(c_int) {
     text_line_glyph_capacity_exceeded = 67,
     glyph_cache_capacity_exceeded = 68,
     glyph_raster_too_large = 69,
+    font_capacity_exceeded = 70,
+    text_line_cache_capacity_exceeded = 71,
 
     pub fn fromError(err: Error) Status {
         return switch (err) {
@@ -198,7 +200,7 @@ pub const Status = enum(c_int) {
             Error.InvalidFontSlot => .invalid_font_slot,
             Error.InvalidFontHandle => .invalid_font_handle,
             Error.NoFont => .invalid_font_handle,
-            Error.FontCapacityExceeded => .invalid_font_handle,
+            Error.FontCapacityExceeded => .font_capacity_exceeded,
             Error.FontUnavailable => .font_unavailable,
             Error.FontVariationUnavailable => .font_variation_unavailable,
             Error.FontRegistrationFailed => .font_registration_failed,
@@ -208,6 +210,7 @@ pub const Status = enum(c_int) {
             Error.GlyphCapacityExceeded => .text_line_glyph_capacity_exceeded,
             Error.CachedGlyphCapacityExceeded => .glyph_cache_capacity_exceeded,
             Error.RasterTooLarge => .glyph_raster_too_large,
+            Error.LineCacheCapacityExceeded => .text_line_cache_capacity_exceeded,
             Error.MissingGlyph,
             Error.UnsupportedCodepoint,
             Error.InvalidAtlas,
@@ -236,13 +239,14 @@ pub const Surface = struct {
     frames: [max_frames_in_flight]GpuFrame,
     draw_commands: [scene.max_draw_commands]scene.DrawCommand = undefined,
     frame_storage: ui_frame.Storage = .{},
-    font_records: [text.max_fonts]FontRecord = [_]FontRecord{.{}} ** text.max_fonts,
-    glyph_cache: [text.max_cached_glyphs]text.CachedGlyph = [_]text.CachedGlyph{.{}} ** text.max_cached_glyphs,
+    font_records: [text.max_fonts]FontRecord = @splat(.{}),
+    glyph_cache: [text.max_cached_glyphs]text.CachedGlyph = @splat(.{}),
     glyph_cache_count: u32 = 0,
-    glyph_atlases: [text.max_atlas_pages]text.GlyphAtlasStorage = [_]text.GlyphAtlasStorage{.{}} ** text.max_atlas_pages,
-    raster_scratch: [text.max_raster_byte_len]u8 = [_]u8{0} ** text.max_raster_byte_len,
+    glyph_atlases: [text.max_atlas_pages]text.GlyphAtlasStorage = @splat(.{}),
+    raster_scratch: [text.max_raster_byte_len]u8 = @splat(0),
     raw_text_runs: [text.max_line_runs]macos_text.RawTextRun = undefined,
     raw_shaped_glyphs: [text.max_line_glyphs]macos_text.RawShapedGlyph = undefined,
+    raw_fallback_fonts: [text.max_fallback_fonts]macos_text.PlatformFont = @splat(.{}),
     mask_atlas: mask.AtlasStorage = .{},
     text_textures: [text.max_atlas_pages]mtl.resource.OwnedTexture,
     mask_texture: mtl.resource.OwnedTexture,
@@ -318,7 +322,7 @@ pub const Surface = struct {
             text_textures[text_texture_count] = try createGlyphTexture(owned_device.ref());
         }
 
-        var font_records: [text.max_fonts]FontRecord = [_]FontRecord{.{}} ** text.max_fonts;
+        var font_records: [text.max_fonts]FontRecord = @splat(.{});
         var loaded_font_count: usize = 0;
         errdefer {
             for (font_records[0..loaded_font_count]) |*record| {
@@ -400,12 +404,13 @@ pub const Surface = struct {
             .draw_commands = undefined,
             .frame_storage = .{},
             .font_records = font_records,
-            .glyph_cache = [_]text.CachedGlyph{.{}} ** text.max_cached_glyphs,
+            .glyph_cache = @splat(.{}),
             .glyph_cache_count = 0,
-            .glyph_atlases = [_]text.GlyphAtlasStorage{.{}} ** text.max_atlas_pages,
-            .raster_scratch = [_]u8{0} ** text.max_raster_byte_len,
+            .glyph_atlases = @splat(.{}),
+            .raster_scratch = @splat(0),
             .raw_text_runs = undefined,
             .raw_shaped_glyphs = undefined,
+            .raw_fallback_fonts = @splat(.{}),
             .mask_atlas = mask_atlas,
             .text_textures = text_textures,
             .mask_texture = mask_texture,
@@ -511,6 +516,7 @@ pub const Surface = struct {
         if (runs.len == 0 or runs.len > text.max_line_runs) return Error.InvalidFontOptions;
 
         var byte_len: usize = 0;
+        const max_text_bytes = std.math.maxInt(u32);
         for (runs, 0..) |run, index| {
             if (run.bytes.len == 0 or !std.unicode.utf8ValidateSlice(run.bytes)) return Error.InvalidUtf8;
             if (run.size <= 0.0 or !std.math.isFinite(run.size)) return Error.InvalidFontOptions;
@@ -525,17 +531,34 @@ pub const Surface = struct {
                 .size = run.size,
                 .color = .{ run.color.r, run.color.g, run.color.b, run.color.a },
             };
+            if (run.bytes.len > max_text_bytes - byte_len) return Error.InvalidUtf8;
             byte_len += run.bytes.len;
-            if (byte_len > std.math.maxInt(u32)) return Error.InvalidUtf8;
         }
 
-        const metrics = try macos_text.shapeLine(surface.raw_text_runs[0..runs.len], surface.raw_shaped_glyphs[0..]);
+        const metrics = try macos_text.shapeLine(
+            surface.raw_text_runs[0..runs.len],
+            surface.raw_shaped_glyphs[0..],
+            surface.raw_fallback_fonts[0..],
+        );
         if (metrics.glyph_count > storage.glyphs.len) return Error.LineGlyphCapacityExceeded;
+        if (metrics.fallback_count > text.max_fallback_fonts) return Error.FontCapacityExceeded;
+
+        var fallback_handles: [text.max_fallback_fonts]text.FontHandle = @splat(.{});
+        try surface.resolveFallbackFonts(
+            surface.raw_fallback_fonts[0..@intCast(metrics.fallback_count)],
+            fallback_handles[0..@intCast(metrics.fallback_count)],
+        );
 
         const glyph_count: usize = @intCast(metrics.glyph_count);
         var visible_count: usize = 0;
         for (surface.raw_shaped_glyphs[0..glyph_count]) |raw| {
-            const handle: text.FontHandle = .{ .index = raw.font_index, .generation = raw.font_generation };
+            const handle = if (raw.fallback_index == text.no_fallback_index) text.FontHandle{
+                .index = raw.font_index,
+                .generation = raw.font_generation,
+            } else fallback: {
+                if (raw.fallback_index >= metrics.fallback_count) return Error.InvalidFontHandle;
+                break :fallback fallback_handles[@intCast(raw.fallback_index)];
+            };
             const cached = try surface.ensureGlyph(handle, raw.glyph_id, raw.size, raw.x);
             if (cached.width == 0.0 or cached.height == 0.0) continue;
             storage.glyphs[visible_count] = .{
@@ -580,6 +603,40 @@ pub const Surface = struct {
             }
         }
         return Error.FontCapacityExceeded;
+    }
+
+    fn resolveFallbackFonts(surface: *Surface, fallback_fonts: []macos_text.PlatformFont, out_handles: []text.FontHandle) Error!void {
+        if (fallback_fonts.len > out_handles.len) return Error.FontCapacityExceeded;
+
+        var index: usize = 0;
+        errdefer {
+            for (fallback_fonts[index..]) |*fallback_font| {
+                macos_text.releaseFont(fallback_font);
+            }
+        }
+
+        while (index < fallback_fonts.len) : (index += 1) {
+            const fallback_font = &fallback_fonts[index];
+            if (surface.findFontByPostscript(fallback_font.*)) |handle| {
+                out_handles[index] = handle;
+                macos_text.releaseFont(fallback_font);
+            } else {
+                out_handles[index] = try surface.addFont(fallback_font.*);
+                fallback_font.* = .{};
+            }
+        }
+    }
+
+    fn findFontByPostscript(surface: *const Surface, platform_font: macos_text.PlatformFont) ?text.FontHandle {
+        if (platform_font.postscript_name_len == 0) return null;
+        const needle = platform_font.postscript_name[0..platform_font.postscript_name_len];
+        for (&surface.font_records, 0..) |*record, index| {
+            if (!record.occupied or record.platform.postscript_name_len != needle.len) continue;
+            if (std.mem.eql(u8, record.platform.postscript_name[0..record.platform.postscript_name_len], needle)) {
+                return record.handle(index);
+            }
+        }
+        return null;
     }
 
     fn fontIndex(surface: *const Surface, handle: text.FontHandle) Error!usize {
@@ -687,7 +744,7 @@ pub const Surface = struct {
         }
         surface.drawable_size = drawable_size;
         surface.scale = scale;
-        surface.resize_generation +%= 1;
+        surface.resize_generation += 1;
     }
 
     pub fn nextCommandAllocator(surface: *Surface) Error!mtl.command.CommandAllocator {
@@ -709,7 +766,7 @@ pub const Surface = struct {
 
     pub fn signalFrameCompletion(surface: *Surface) void {
         mtl.command.signalEvent(surface.command_queue.ref(), surface.frame_event.ref(), surface.current_frame_index);
-        surface.current_frame_index +%= 1;
+        surface.current_frame_index += 1;
     }
 
     pub fn drawScene(surface: *Surface, frame_scene: *const scene.Scene, drawable_id: ObjCId) Error!void {
@@ -1133,6 +1190,7 @@ test "surface status values stay stable across the Objective-C ABI" {
     try std.testing.expectEqual(@as(c_int, 59), @intFromEnum(Status.invalid_font_slot));
     try std.testing.expectEqual(@as(c_int, 60), @intFromEnum(Status.font_variation_unavailable));
     try std.testing.expectEqual(Status.font_variation_unavailable, Status.fromError(Error.FontVariationUnavailable));
+    try std.testing.expectEqual(Status.font_capacity_exceeded, Status.fromError(Error.FontCapacityExceeded));
     try std.testing.expectEqual(@as(c_int, 61), @intFromEnum(Status.invalid_mask_id));
     try std.testing.expectEqual(@as(c_int, 62), @intFromEnum(Status.invalid_mask));
     try std.testing.expectEqual(@as(c_int, 63), @intFromEnum(Status.mask_atlas_full));
@@ -1141,6 +1199,9 @@ test "surface status values stay stable across the Objective-C ABI" {
     try std.testing.expectEqual(Status.invalid_mask, Status.fromError(Error.InvalidMask));
     try std.testing.expectEqual(Status.mask_atlas_full, Status.fromError(Error.AtlasFull));
     try std.testing.expectEqual(Status.mask_entry_capacity_exceeded, Status.fromError(Error.EntryCapacityExceeded));
+    try std.testing.expectEqual(@as(c_int, 70), @intFromEnum(Status.font_capacity_exceeded));
+    try std.testing.expectEqual(Status.text_line_cache_capacity_exceeded, Status.fromError(Error.LineCacheCapacityExceeded));
+    try std.testing.expectEqual(@as(c_int, 71), @intFromEnum(Status.text_line_cache_capacity_exceeded));
 }
 
 test "surface clip validation rejects scissors outside the drawable" {

@@ -54,7 +54,7 @@ pub const KeyEvent = extern struct {
 };
 
 pub const TextInputEvent = extern struct {
-    bytes: [8]u8 = [_]u8{0} ** 8,
+    bytes: [8]u8 = @splat(0),
     len: u32 = 0,
     mods: u32 = 0,
     timestamp: f64 = 0.0,
@@ -127,9 +127,9 @@ pub const Draw = struct {
         try draw.fill(ruleRect(edge, bounds, width), color);
     }
 
-    pub fn textLine(draw: *Draw, origin: ui.layout.Point, line: TextLine) Error!void {
+    pub fn textLine(draw: *Draw, origin: ui.layout.Point, line: TextLine, runs: []const text.TextRun) Error!void {
         try draw.frame.flushQuads();
-        try draw.frame.pushTextLine(origin, line, draw.clip, draw.layer);
+        try draw.frame.pushTextLine(origin, line, runs, draw.clip, draw.layer);
     }
 
     pub fn hit(draw: *Draw, id: ui.hit.HitId, bounds: ui.layout.Rect) Error!void {
@@ -397,7 +397,7 @@ pub const Frame = struct {
         return result;
     }
 
-    pub fn pushTextLine(frame: *Frame, origin: ui.layout.Point, line: text.TextLine, clip_index: u32, layer: u32) Error!void {
+    pub fn pushRawTextLine(frame: *Frame, origin: ui.layout.Point, line: text.TextLine, clip_index: u32, layer: u32) Error!void {
         if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
         if (line.glyphs.len == 0) return;
         try frame.flushQuads();
@@ -412,16 +412,39 @@ pub const Frame = struct {
             frame.storage.glyphs[used + index] = instance;
         }
 
+        try frame.appendTextBatch(@intCast(line.glyphs.len), clip_index, layer);
+    }
+
+    pub fn pushTextLine(frame: *Frame, origin: ui.layout.Point, line: text.TextLine, runs: []const text.TextRun, clip_index: u32, layer: u32) Error!void {
+        if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
+        if (line.glyphs.len == 0) return;
+        try frame.flushQuads();
+
+        const used: usize = @intCast(frame.glyph_count);
+        if (line.glyphs.len > frame.storage.glyphs.len - used) return text.Error.GlyphCapacityExceeded;
+
+        for (line.glyphs, 0..) |glyph, index| {
+            var instance = glyph.instance;
+            instance.rect.x += origin.x;
+            instance.rect.y += origin.y;
+            instance.color = text.colorForByte(runs, glyph.byte_index);
+            frame.storage.glyphs[used + index] = instance;
+        }
+
+        try frame.appendTextBatch(@intCast(line.glyphs.len), clip_index, layer);
+    }
+
+    fn appendTextBatch(frame: *Frame, glyph_count: u32, clip_index: u32, layer: u32) Error!void {
         if (frame.text_batch_count >= scene.max_text_batches) return Error.TextBatchCapacityExceeded;
         const batch_index: usize = @intCast(frame.text_batch_count);
         frame.storage.text_batches[batch_index] = .{
             .vertex_start = frame.glyph_count * scene.vertices_per_glyph,
-            .vertex_count = @as(u32, @intCast(line.glyphs.len)) * scene.vertices_per_glyph,
+            .vertex_count = glyph_count * scene.vertices_per_glyph,
             .clip_index = clip_index,
             .layer = layer,
             .order = frame.nextOrder(),
         };
-        frame.glyph_count += @intCast(line.glyphs.len);
+        frame.glyph_count += glyph_count;
         frame.text_batch_count += 1;
     }
 
@@ -503,7 +526,8 @@ pub const Frame = struct {
 
     fn nextOrder(frame: *Frame) u32 {
         const order = frame.draw_order;
-        frame.draw_order +%= 1;
+        std.debug.assert(frame.draw_order < scene.max_draw_commands);
+        frame.draw_order += 1;
         return order;
     }
 };
@@ -839,8 +863,6 @@ test "frame pushes shaped text lines without font lookup" {
     var storage: Storage = .{};
     var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 80.0 } });
     const clip = try frame.clip(frame.root());
-    var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_content });
-
     var line_storage: text.TextLineStorage = undefined;
     line_storage.glyphs[0] = .{
         .instance = .{
@@ -859,13 +881,53 @@ test "frame pushes shaped text lines without font lookup" {
         .glyphs = line_storage.glyphs[0..1],
     };
 
-    try draw.textLine(ui.layout.Point.init(10.0, 20.0), line);
+    try frame.pushRawTextLine(ui.layout.Point.init(10.0, 20.0), line, clip, scene.layer_content);
     const out = try frame.finish();
 
     try std.testing.expectEqual(@as(usize, 1), out.glyphs.len);
     try std.testing.expectEqual(ui.layout.Rect.init(11.0, 22.0, 5.0, 7.0), out.glyphs[0].rect);
     try std.testing.expectEqual(@as(u32, 2), out.glyphs[0].atlas_page);
     try std.testing.expectEqual(@as(usize, 1), out.text_batches.len);
+}
+
+test "frame paints cached text layouts with current run colors" {
+    var storage: Storage = .{};
+    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 80.0 } });
+    const clip = try frame.clip(frame.root());
+    var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_content });
+
+    var line_storage: text.TextLineStorage = undefined;
+    line_storage.glyphs[0] = .{
+        .instance = .{
+            .rect = ui.layout.Rect.init(0.0, 0.0, 5.0, 7.0),
+            .color = ui.style.Color.rgb(1.0, 1.0, 1.0),
+        },
+        .byte_index = 0,
+    };
+    line_storage.glyphs[1] = .{
+        .instance = .{
+            .rect = ui.layout.Rect.init(6.0, 0.0, 5.0, 7.0),
+            .color = ui.style.Color.rgb(1.0, 1.0, 1.0),
+        },
+        .byte_index = 1,
+    };
+    const line: text.TextLine = .{
+        .advance = 11.0,
+        .line_height = 12.0,
+        .bytes_len = 2,
+        .glyphs = line_storage.glyphs[0..2],
+    };
+    const runs = [_]text.TextRun{
+        .{ .bytes = "a", .font = .{ .index = 0, .generation = 1 }, .color = ui.style.Color.rgb(1.0, 0.0, 0.0) },
+        .{ .bytes = "b", .font = .{ .index = 0, .generation = 1 }, .color = ui.style.Color.rgb(0.0, 1.0, 0.0) },
+    };
+
+    try draw.textLine(.{}, line, runs[0..]);
+    const out = try frame.finish();
+
+    try std.testing.expectEqual(@as(usize, 2), out.glyphs.len);
+    try std.testing.expectEqual(ui.style.Color.rgb(1.0, 0.0, 0.0), out.glyphs[0].color);
+    try std.testing.expectEqual(ui.style.Color.rgb(0.0, 1.0, 0.0), out.glyphs[1].color);
 }
 
 test "frame text runs emit one batch with per glyph colors" {

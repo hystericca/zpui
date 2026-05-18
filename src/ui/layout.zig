@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const max_f32: f32 = 3.4028234663852886e38;
+const max_f32 = std.math.floatMax(f32);
 
 pub const Axis = enum(u8) {
     horizontal,

@@ -137,6 +137,7 @@ typedef struct {
     uint32_t font_generation;
     uint32_t glyph_id;
     uint32_t byte_index;
+    uint32_t fallback_index;
     float x;
     float y;
     float size;
@@ -152,6 +153,7 @@ typedef struct {
     float baseline_offset;
     uint32_t bytes_len;
     uint32_t glyph_count;
+    uint32_t fallback_count;
 } ZPUIRawLineMetrics;
 
 typedef struct {
@@ -289,6 +291,7 @@ enum {
     ZPUI_FONT_STATUS_INVALID_HANDLE = 6,
     ZPUI_FONT_STATUS_GLYPH_CAPACITY = 7,
     ZPUI_FONT_STATUS_RASTER_TOO_LARGE = 8,
+    ZPUI_FONT_STATUS_FONT_CAPACITY = 9,
 };
 
 extern int zpui_surface_create(id device, ZPUISurface **outSurface);
@@ -413,6 +416,20 @@ static const char *zpui_platform_status_name(int status) {
         return "mask atlas full";
     case 64:
         return "mask entry capacity exceeded";
+    case 65:
+        return "invalid font handle";
+    case 66:
+        return "invalid utf8";
+    case 67:
+        return "text line glyph capacity exceeded";
+    case 68:
+        return "glyph cache capacity exceeded";
+    case 69:
+        return "glyph raster too large";
+    case 70:
+        return "font capacity exceeded";
+    case 71:
+        return "text line cache capacity exceeded";
     default:
         return "unknown platform error";
     }
@@ -1050,6 +1067,66 @@ void zpui_macos_release_font_descriptor(void *descriptor) {
     }
 }
 
+static void zpui_release_platform_fonts(ZPUIPlatformFont *fonts, uint32_t count) {
+    if (fonts == NULL) {
+        return;
+    }
+    for (uint32_t index = 0; index < count; index++) {
+        if (fonts[index].descriptor != NULL) {
+            CFRelease((CFTypeRef)fonts[index].descriptor);
+        }
+        memset(&fonts[index], 0, sizeof(fonts[index]));
+    }
+}
+
+static bool zpui_platform_font_matches_ctfont(const ZPUIPlatformFont *font, CTFontRef actualFont) {
+    if (font == NULL || font->postscript_name_len == 0 || actualFont == NULL) {
+        return false;
+    }
+
+    char postscript[128];
+    uint32_t postscriptLen = 0;
+    CFStringRef actualPostscript = CTFontCopyPostScriptName(actualFont);
+    zpui_copy_cfstring_utf8(actualPostscript, postscript, sizeof(postscript), &postscriptLen);
+    if (actualPostscript != NULL)
+        CFRelease(actualPostscript);
+    return postscriptLen == font->postscript_name_len &&
+           memcmp(postscript, font->postscript_name, postscriptLen) == 0;
+}
+
+static int zpui_fallback_font_index(CTFontRef actualFont, ZPUIPlatformFont *fallbackFonts,
+                                    uint32_t *fallbackCount, uint32_t fallbackCapacity,
+                                    uint32_t *outIndex) {
+    if (actualFont == NULL || fallbackFonts == NULL || fallbackCount == NULL || outIndex == NULL) {
+        return ZPUI_FONT_STATUS_INVALID_HANDLE;
+    }
+
+    for (uint32_t index = 0; index < *fallbackCount; index++) {
+        if (zpui_platform_font_matches_ctfont(&fallbackFonts[index], actualFont)) {
+            *outIndex = index;
+            return ZPUI_FONT_STATUS_OK;
+        }
+    }
+    if (*fallbackCount >= fallbackCapacity) {
+        return ZPUI_FONT_STATUS_FONT_CAPACITY;
+    }
+
+    CTFontDescriptorRef descriptor = CTFontCopyFontDescriptor(actualFont);
+    if (descriptor == NULL) {
+        return ZPUI_FONT_STATUS_UNAVAILABLE;
+    }
+    const uint32_t index = *fallbackCount;
+    const int status = zpui_finish_platform_font(descriptor, &fallbackFonts[index]);
+    if (status != ZPUI_FONT_STATUS_OK) {
+        CFRelease(descriptor);
+        return status;
+    }
+
+    *fallbackCount += 1;
+    *outIndex = index;
+    return ZPUI_FONT_STATUS_OK;
+}
+
 static size_t zpui_utf8_codepoint_len(uint8_t byte) {
     if ((byte & 0x80u) == 0)
         return 1;
@@ -1145,11 +1222,14 @@ static const ZPUIRawTextRun *zpui_run_for_utf16_index(const ZPUIRawTextRun *runs
 
 int zpui_macos_shape_line(const ZPUIRawTextRun *runs, uint32_t runCount,
                           ZPUIRawShapedGlyph *outGlyphs, uint32_t glyphCapacity,
+                          ZPUIPlatformFont *outFallbackFonts, uint32_t fallbackCapacity,
                           ZPUIRawLineMetrics *outMetrics) {
-    if (runs == NULL || runCount == 0 || outGlyphs == NULL || outMetrics == NULL) {
+    if (runs == NULL || runCount == 0 || outGlyphs == NULL || outFallbackFonts == NULL ||
+        outMetrics == NULL) {
         return ZPUI_FONT_STATUS_FAILED;
     }
     memset(outMetrics, 0, sizeof(*outMetrics));
+    memset(outFallbackFonts, 0, sizeof(*outFallbackFonts) * (size_t)fallbackCapacity);
 
     size_t totalBytes = 0;
     for (uint32_t runIndex = 0; runIndex < runCount; runIndex++) {
@@ -1236,6 +1316,7 @@ int zpui_macos_shape_line(const ZPUIRawTextRun *runs, uint32_t runCount,
     CFArrayRef glyphRuns = CTLineGetGlyphRuns(line);
     const CFIndex glyphRunCount = glyphRuns != NULL ? CFArrayGetCount(glyphRuns) : 0;
     uint32_t outCount = 0;
+    uint32_t fallbackCount = 0;
     for (CFIndex glyphRunIndex = 0; glyphRunIndex < glyphRunCount; glyphRunIndex++) {
         CTRunRef run = (CTRunRef)CFArrayGetValueAtIndex(glyphRuns, glyphRunIndex);
         const CFIndex glyphCount = CTRunGetGlyphCount(run);
@@ -1246,6 +1327,7 @@ int zpui_macos_shape_line(const ZPUIRawTextRun *runs, uint32_t runCount,
             free(glyphs);
             free(positions);
             free(indices);
+            zpui_release_platform_fonts(outFallbackFonts, fallbackCount);
             CFRelease(line);
             free(utf16ToUtf8);
             free(allBytes);
@@ -1256,35 +1338,18 @@ int zpui_macos_shape_line(const ZPUIRawTextRun *runs, uint32_t runCount,
         CTRunGetPositions(run, CFRangeMake(0, 0), positions);
         CTRunGetStringIndices(run, CFRangeMake(0, 0), indices);
 
-        if (glyphCount > 0) {
-            const NSUInteger firstStringIndex = indices[0] < 0 ? 0 : (NSUInteger)indices[0];
-            const ZPUIRawTextRun *firstSourceRun =
-                zpui_run_for_utf16_index(runs, runStarts, runCount, firstStringIndex);
-            CFDictionaryRef attributes = CTRunGetAttributes(run);
-            CTFontRef actualFont =
-                attributes != NULL ? (CTFontRef)CFDictionaryGetValue(attributes, kCTFontAttributeName) : NULL;
-            CTFontRef requestedFont = CTFontCreateWithFontDescriptor(
-                (CTFontDescriptorRef)firstSourceRun->descriptor, (CGFloat)firstSourceRun->size, NULL);
-            const bool fontMatched = zpui_font_postscript_equal(actualFont, requestedFont);
-            if (requestedFont != NULL)
-                CFRelease(requestedFont);
-            if (!fontMatched) {
-                free(glyphs);
-                free(positions);
-                free(indices);
-                CFRelease(line);
-                free(utf16ToUtf8);
-                free(allBytes);
-                free(runStarts);
-                return ZPUI_FONT_STATUS_UNAVAILABLE;
-            }
-        }
+        CFDictionaryRef attributes = CTRunGetAttributes(run);
+        CTFontRef actualFont =
+            attributes != NULL ? (CTFontRef)CFDictionaryGetValue(attributes, kCTFontAttributeName) : NULL;
+        uint32_t runFallbackIndex = UINT32_MAX;
+        const bool hasActualFont = actualFont != NULL;
 
         for (CFIndex glyphIndex = 0; glyphIndex < glyphCount; glyphIndex++) {
             if (outCount >= glyphCapacity) {
                 free(glyphs);
                 free(positions);
                 free(indices);
+                zpui_release_platform_fonts(outFallbackFonts, fallbackCount);
                 CFRelease(line);
                 free(utf16ToUtf8);
                 free(allBytes);
@@ -1293,11 +1358,39 @@ int zpui_macos_shape_line(const ZPUIRawTextRun *runs, uint32_t runCount,
             }
             const NSUInteger stringIndex = indices[glyphIndex] < 0 ? 0 : (NSUInteger)indices[glyphIndex];
             const ZPUIRawTextRun *sourceRun = zpui_run_for_utf16_index(runs, runStarts, runCount, stringIndex);
+            uint32_t fallbackIndex = UINT32_MAX;
+            if (hasActualFont) {
+                CTFontRef requestedFont = CTFontCreateWithFontDescriptor(
+                    (CTFontDescriptorRef)sourceRun->descriptor, (CGFloat)sourceRun->size, NULL);
+                const bool fontMatched = zpui_font_postscript_equal(actualFont, requestedFont);
+                if (requestedFont != NULL)
+                    CFRelease(requestedFont);
+                if (!fontMatched) {
+                    if (runFallbackIndex == UINT32_MAX) {
+                        const int fallbackStatus = zpui_fallback_font_index(
+                            actualFont, outFallbackFonts, &fallbackCount, fallbackCapacity,
+                            &runFallbackIndex);
+                        if (fallbackStatus != ZPUI_FONT_STATUS_OK) {
+                            free(glyphs);
+                            free(positions);
+                            free(indices);
+                            zpui_release_platform_fonts(outFallbackFonts, fallbackCount);
+                            CFRelease(line);
+                            free(utf16ToUtf8);
+                            free(allBytes);
+                            free(runStarts);
+                            return fallbackStatus;
+                        }
+                    }
+                    fallbackIndex = runFallbackIndex;
+                }
+            }
             ZPUIRawShapedGlyph *out = &outGlyphs[outCount++];
             out->font_index = sourceRun->font_index;
             out->font_generation = sourceRun->font_generation;
             out->glyph_id = (uint32_t)glyphs[glyphIndex];
             out->byte_index = utf16ToUtf8[stringIndex <= utf16Length ? stringIndex : utf16Length];
+            out->fallback_index = fallbackIndex;
             out->x = (float)positions[glyphIndex].x;
             out->y = (float)positions[glyphIndex].y;
             out->size = sourceRun->size;
@@ -1309,6 +1402,7 @@ int zpui_macos_shape_line(const ZPUIRawTextRun *runs, uint32_t runCount,
         free(indices);
     }
     outMetrics->glyph_count = outCount;
+    outMetrics->fallback_count = fallbackCount;
 
     CFRelease(line);
     free(utf16ToUtf8);

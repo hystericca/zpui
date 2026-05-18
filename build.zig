@@ -55,7 +55,7 @@ fn addAppModule(
     b: *std.Build,
     name: []const u8,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.OptimizeMode,
     zmtl4: *std.Build.Module,
 ) *std.Build.Module {
     const module = b.addModule(name, .{

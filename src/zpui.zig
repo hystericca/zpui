@@ -29,6 +29,10 @@ pub const SceneBuilder = core.SceneBuilder;
 pub const SceneStorage = core.SceneStorage;
 pub const TextMetrics = core.TextMetrics;
 pub const TextLine = core.TextLine;
+pub const LineCache = core.LineCache;
+pub const LineCacheKey = core.LineCacheKey;
+pub const LineCacheStats = core.LineCacheStats;
+pub const LineCacheType = core.LineCacheType;
 pub const TextLineStorage = core.TextLineStorage;
 pub const RowTextPlacement = core.RowTextPlacement;
 pub const DrawContext = platform.macos.DrawContext;
@@ -43,6 +47,7 @@ pub const WindowTitlebarSeparatorStyle = platform.macos.WindowTitlebarSeparatorS
 pub const WindowToolbarStyle = platform.macos.WindowToolbarStyle;
 pub const initWindow = platform.macos.initWindow;
 pub const fontAxis = core.fontAxis;
+pub const lineCacheKey = core.lineCacheKey;
 
 test {
     const std = @import("std");

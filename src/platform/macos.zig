@@ -175,10 +175,10 @@ const RawInputSnapshot = extern struct {
     text_count: u32 = 0,
     mouse_count: u32 = 0,
     scroll_count: u32 = 0,
-    keys: [frame.max_key_events]frame.KeyEvent = [_]frame.KeyEvent{.{}} ** frame.max_key_events,
-    text: [frame.max_text_events]frame.TextInputEvent = [_]frame.TextInputEvent{.{}} ** frame.max_text_events,
-    mouse: [frame.max_mouse_events]frame.MouseEvent = [_]frame.MouseEvent{.{}} ** frame.max_mouse_events,
-    scroll: [frame.max_scroll_events]frame.ScrollEvent = [_]frame.ScrollEvent{.{}} ** frame.max_scroll_events,
+    keys: [frame.max_key_events]frame.KeyEvent = @splat(.{}),
+    text: [frame.max_text_events]frame.TextInputEvent = @splat(.{}),
+    mouse: [frame.max_mouse_events]frame.MouseEvent = @splat(.{}),
+    scroll: [frame.max_scroll_events]frame.ScrollEvent = @splat(.{}),
 };
 
 comptime {
@@ -257,6 +257,21 @@ pub const DrawContext = opaque {
 
     pub fn shapeLine(ctx: *DrawContext, storage: *text.TextLineStorage, runs: []const text.TextRun) surface.Error!text.TextLine {
         return ctx.native().surface.shapeLine(storage, runs);
+    }
+
+    pub fn beginTextFrame(_: *DrawContext, cache: anytype) void {
+        cache.beginFrame();
+    }
+
+    pub fn layoutLineCached(ctx: *DrawContext, cache: anytype, runs: []const text.TextRun) surface.Error!text.TextLine {
+        return ctx.layoutLineCachedKey(cache, try text.lineCacheKey(runs), runs);
+    }
+
+    pub fn layoutLineCachedKey(ctx: *DrawContext, cache: anytype, key: text.LineCacheKey, runs: []const text.TextRun) surface.Error!text.TextLine {
+        if (try cache.lookup(key)) |cached| return cached;
+
+        const shaped = try ctx.native().surface.shapeLine(&cache.scratch, runs);
+        return cache.store(key, shaped);
     }
 
     pub fn maskAtlas(ctx: *DrawContext) *const mask.AtlasStorage {

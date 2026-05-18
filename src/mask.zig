@@ -30,8 +30,8 @@ pub const Instance = extern struct {
 };
 
 pub const AtlasStorage = struct {
-    bytes: [atlas_byte_len]u8 = [_]u8{0} ** atlas_byte_len,
-    rects: [max_entries]AtlasRect = [_]AtlasRect{.{}} ** max_entries,
+    bytes: [atlas_byte_len]u8 = @splat(0),
+    rects: [max_entries]AtlasRect = @splat(.{}),
     count: u32 = 0,
     next_x: u32 = 0,
     next_y: u32 = 0,
@@ -39,7 +39,7 @@ pub const AtlasStorage = struct {
 
     pub fn clear(atlas: *AtlasStorage) void {
         @memset(&atlas.bytes, 0);
-        atlas.rects = [_]AtlasRect{.{}} ** max_entries;
+        atlas.rects = @splat(.{});
         atlas.count = 0;
         atlas.next_x = 0;
         atlas.next_y = 0;
@@ -72,11 +72,15 @@ pub const AtlasStorage = struct {
 
         const dst_x = atlas.next_x + pack_padding;
         const dst_y = atlas.next_y + pack_padding;
-        var row: u32 = 0;
-        while (row < height) : (row += 1) {
-            const src_start = @as(usize, @intCast(row)) * @as(usize, @intCast(bytes_per_row));
-            const dst_start = @as(usize, @intCast(dst_y + row)) * atlas_width + @as(usize, @intCast(dst_x));
-            @memcpy(atlas.bytes[dst_start .. dst_start + @as(usize, @intCast(width))], bytes[src_start .. src_start + @as(usize, @intCast(width))]);
+        const w: usize = @intCast(width);
+        const h: usize = @intCast(height);
+        const stride: usize = @intCast(bytes_per_row);
+        const dst_x_usize: usize = @intCast(dst_x);
+        const dst_y_usize: usize = @intCast(dst_y);
+        for (0..h) |row| {
+            const src_start = row * stride;
+            const dst_start = (dst_y_usize + row) * atlas_width + dst_x_usize;
+            @memcpy(atlas.bytes[dst_start..][0..w], bytes[src_start..][0..w]);
         }
 
         const id = atlas.count;

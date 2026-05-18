@@ -22,11 +22,19 @@ pub const SceneBuilder = scene.SceneBuilder;
 pub const SceneStorage = scene.SceneStorage;
 pub const TextMetrics = text.TextMetrics;
 pub const TextLine = text.TextLine;
+pub const LineCache = text.LineCache;
+pub const LineCacheKey = text.LineCacheKey;
+pub const LineCacheStats = text.LineCacheStats;
+pub const LineCacheType = text.LineCacheType;
 pub const TextLineStorage = text.TextLineStorage;
 pub const RowTextPlacement = text.RowTextPlacement;
 
 pub fn fontAxis(comptime tag: []const u8) u32 {
     return text.axis(tag);
+}
+
+pub fn lineCacheKey(runs: []const text.TextRun) text.Error!text.LineCacheKey {
+    return text.lineCacheKey(runs);
 }
 
 test {

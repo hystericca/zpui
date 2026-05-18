@@ -1,256 +1,100 @@
 const std = @import("std");
 
+const defs = @import("text/defs.zig");
+const font_mod = @import("text/font.zig");
+const atlas_mod = @import("text/atlas.zig");
+const line_mod = @import("text/line.zig");
+const cache_mod = @import("text/cache.zig");
 const layout = @import("ui/layout.zig");
 const style = @import("ui/style.zig");
 
-pub const max_frame_glyphs = 16384;
-pub const atlas_width = 1024;
-pub const atlas_height = 512;
-pub const atlas_byte_len = atlas_width * atlas_height;
-pub const glyph_atlas_width = 2048;
-pub const glyph_atlas_height = 2048;
-pub const glyph_atlas_byte_len = glyph_atlas_width * glyph_atlas_height;
-pub const glyph_table_len = 128;
-pub const max_font_slots = 4;
-pub const max_fonts = 64;
-pub const max_atlas_pages = 4;
-pub const max_cached_glyphs = 8192;
-pub const max_dirty_rects = 256;
-pub const max_line_glyphs = 4096;
-pub const max_line_runs = 256;
-pub const max_raster_width = 256;
-pub const max_raster_height = 256;
-pub const max_raster_byte_len = max_raster_width * max_raster_height;
-pub const default_font_slot: u32 = 0;
-pub const max_font_family_len = 127;
-pub const max_resolved_font_name_len = 127;
-pub const max_font_variations = 8;
-pub const default_font_family: [:0]const u8 = "Menlo";
-pub const default_font_size: f32 = 13.0;
+pub const max_frame_glyphs = defs.max_frame_glyphs;
+pub const atlas_width = defs.atlas_width;
+pub const atlas_height = defs.atlas_height;
+pub const atlas_byte_len = defs.atlas_byte_len;
+pub const glyph_atlas_width = defs.glyph_atlas_width;
+pub const glyph_atlas_height = defs.glyph_atlas_height;
+pub const glyph_atlas_byte_len = defs.glyph_atlas_byte_len;
+pub const glyph_table_len = defs.glyph_table_len;
+pub const max_font_slots = defs.max_font_slots;
+pub const max_fonts = defs.max_fonts;
+pub const max_fallback_fonts = defs.max_fallback_fonts;
+pub const max_atlas_pages = defs.max_atlas_pages;
+pub const max_cached_glyphs = defs.max_cached_glyphs;
+pub const max_dirty_rects = defs.max_dirty_rects;
+pub const max_line_glyphs = defs.max_line_glyphs;
+pub const max_line_runs = defs.max_line_runs;
+pub const max_line_cache_entries = defs.max_line_cache_entries;
+pub const max_line_cache_glyphs = defs.max_line_cache_glyphs;
+pub const max_raster_width = defs.max_raster_width;
+pub const max_raster_height = defs.max_raster_height;
+pub const max_raster_byte_len = defs.max_raster_byte_len;
+pub const default_font_slot = defs.default_font_slot;
+pub const no_fallback_index = defs.no_fallback_index;
+pub const max_font_family_len = defs.max_font_family_len;
+pub const max_resolved_font_name_len = defs.max_resolved_font_name_len;
+pub const max_font_variations = defs.max_font_variations;
+pub const default_font_family = defs.default_font_family;
+pub const default_font_size = defs.default_font_size;
+pub const ascii_first = defs.ascii_first;
+pub const ascii_last = defs.ascii_last;
+pub const Error = defs.Error;
 
-pub const ascii_first = 32;
-pub const ascii_last = 126;
+pub const FontVariation = font_mod.FontVariation;
+pub const FontOptions = font_mod.FontOptions;
+pub const FontLoadOptions = font_mod.FontLoadOptions;
+pub const FontHandle = font_mod.FontHandle;
+pub const FontAxis = font_mod.FontAxis;
+pub const FontInfo = font_mod.FontInfo;
 
-pub const Error = error{
-    NoFont,
-    InvalidFontSlot,
-    InvalidFontHandle,
-    InvalidFontOptions,
-    FontCapacityExceeded,
-    GlyphCapacityExceeded,
-    LineGlyphCapacityExceeded,
-    CachedGlyphCapacityExceeded,
-    MissingGlyph,
-    UnsupportedCodepoint,
-    InvalidUtf8,
-    InvalidAtlas,
-    AtlasFull,
-    RasterTooLarge,
-};
+pub const glyph_present = atlas_mod.glyph_present;
+pub const glyph_visible = atlas_mod.glyph_visible;
+pub const AtlasStorage = atlas_mod.AtlasStorage;
+pub const DirtyRect = atlas_mod.DirtyRect;
+pub const PackedGlyph = atlas_mod.PackedGlyph;
+pub const GlyphAtlasStorage = atlas_mod.GlyphAtlasStorage;
+pub const FontMetrics = atlas_mod.FontMetrics;
+pub const GlyphMetric = atlas_mod.GlyphMetric;
+pub const AtlasRect = atlas_mod.AtlasRect;
+pub const GlyphInstance = atlas_mod.GlyphInstance;
+pub const GlyphCacheKey = atlas_mod.GlyphCacheKey;
+pub const CachedGlyph = atlas_mod.CachedGlyph;
 
-pub const FontVariation = extern struct {
-    tag: u32 = 0,
-    value: f32 = 0.0,
-
-    pub fn valid(variation: FontVariation) bool {
-        return variation.tag != 0 and std.math.isFinite(variation.value);
-    }
-};
+pub const PushResult = line_mod.PushResult;
+pub const TextRun = line_mod.TextRun;
+pub const AsciiRun = line_mod.AsciiRun;
+pub const LineGlyph = line_mod.LineGlyph;
+pub const TextLineStorage = line_mod.TextLineStorage;
+pub const TextLine = line_mod.TextLine;
+pub const LineCacheKey = cache_mod.LineCacheKey;
+pub const LineCacheStats = cache_mod.LineCacheStats;
+pub const LineCache = cache_mod.LineCache;
+pub const LineCacheType = cache_mod.LineCacheType;
 
 pub fn axis(comptime tag: []const u8) u32 {
-    comptime {
-        if (tag.len != 4) @compileError("font variation axis tags must be four bytes");
-    }
-    return (@as(u32, tag[0]) << 24) |
-        (@as(u32, tag[1]) << 16) |
-        (@as(u32, tag[2]) << 8) |
-        @as(u32, tag[3]);
+    return font_mod.axis(tag);
 }
 
-pub const FontOptions = struct {
-    family: [:0]const u8 = default_font_family,
-    size: f32 = default_font_size,
-    variations: []const FontVariation = &.{},
+pub fn glyphCacheKey(font: FontHandle, glyph_id: u32, size: f32, scale: f32, subpixel_x: u32) GlyphCacheKey {
+    return atlas_mod.glyphCacheKey(font, glyph_id, size, scale, subpixel_x);
+}
 
-    pub fn valid(options: FontOptions) bool {
-        if (options.family.len == 0 or options.family.len > max_font_family_len) return false;
-        if (options.size <= 0.0 or !std.math.isFinite(options.size)) return false;
-        if (options.variations.len > max_font_variations) return false;
-        for (options.variations, 0..) |variation, index| {
-            if (!variation.valid()) return false;
-            for (options.variations[0..index]) |previous| {
-                if (previous.tag == variation.tag) return false;
-            }
-        }
-        return true;
-    }
-};
+pub fn glyphCacheKeyEqual(a: GlyphCacheKey, b: GlyphCacheKey) bool {
+    return atlas_mod.glyphCacheKeyEqual(a, b);
+}
 
-pub const FontLoadOptions = struct {
-    face: ?[:0]const u8 = null,
-    variations: []const FontVariation = &.{},
+pub fn lineCacheKey(runs: []const TextRun) Error!LineCacheKey {
+    return cache_mod.lineCacheKey(runs);
+}
 
-    pub fn valid(options: FontLoadOptions) bool {
-        if (options.face) |face| {
-            if (face.len == 0 or face.len > max_resolved_font_name_len) return false;
-        }
-        if (options.variations.len > max_font_variations) return false;
-        for (options.variations, 0..) |variation, index| {
-            if (!variation.valid()) return false;
-            for (options.variations[0..index]) |previous| {
-                if (previous.tag == variation.tag) return false;
-            }
-        }
-        return true;
-    }
-};
-
-pub const FontHandle = extern struct {
-    index: u32 = std.math.maxInt(u32),
-    generation: u32 = 0,
-
-    pub fn valid(handle: FontHandle) bool {
-        return handle.index < max_fonts and handle.generation != 0;
-    }
-};
-
-pub const FontAxis = extern struct {
-    tag: u32 = 0,
-    min: f32 = 0.0,
-    max: f32 = 0.0,
-    default_value: f32 = 0.0,
-};
-
-pub const FontInfo = struct {
-    postscript_name: []const u8 = &.{},
-    family_name: []const u8 = &.{},
-    display_name: []const u8 = &.{},
-    axes: []const FontAxis = &.{},
-};
-
-pub const glyph_present: u32 = 1 << 0;
-pub const glyph_visible: u32 = 1 << 1;
-
-pub const AtlasStorage = struct {
-    bytes: [atlas_byte_len]u8 = [_]u8{0} ** atlas_byte_len,
-};
-
-pub const DirtyRect = extern struct {
-    page: u32 = 0,
-    x: u32 = 0,
-    y: u32 = 0,
-    width: u32 = 0,
-    height: u32 = 0,
-};
-
-pub const PackedGlyph = extern struct {
-    page: u32 = 0,
-    x: u32 = 0,
-    y: u32 = 0,
-    width: u32 = 0,
-    height: u32 = 0,
-};
-
-pub const GlyphAtlasStorage = struct {
-    bytes: [glyph_atlas_byte_len]u8 = [_]u8{0} ** glyph_atlas_byte_len,
-    next_x: u32 = 0,
-    next_y: u32 = 0,
-    row_height: u32 = 0,
-
-    pub fn clear(atlas: *GlyphAtlasStorage) void {
-        @memset(&atlas.bytes, 0);
-        atlas.next_x = 0;
-        atlas.next_y = 0;
-        atlas.row_height = 0;
-    }
-
-    pub fn append(atlas: *GlyphAtlasStorage, page: u32, width: u32, height: u32, bytes: []const u8, bytes_per_row: u32) Error!PackedGlyph {
-        if (width == 0 or height == 0 or bytes_per_row < width) return Error.InvalidAtlas;
-        if (width > glyph_atlas_width or height > glyph_atlas_height) return Error.AtlasFull;
-        const required_len = @as(usize, @intCast(bytes_per_row)) * @as(usize, @intCast(height));
-        if (bytes.len < required_len) return Error.InvalidAtlas;
-
-        if (atlas.next_x + width > glyph_atlas_width) {
-            atlas.next_x = 0;
-            atlas.next_y += atlas.row_height;
-            atlas.row_height = 0;
-        }
-        if (atlas.next_y + height > glyph_atlas_height) return Error.AtlasFull;
-
-        const dst_x = atlas.next_x;
-        const dst_y = atlas.next_y;
-        var row: u32 = 0;
-        while (row < height) : (row += 1) {
-            const src_start = @as(usize, @intCast(row)) * @as(usize, @intCast(bytes_per_row));
-            const dst_start = @as(usize, @intCast(dst_y + row)) * glyph_atlas_width + @as(usize, @intCast(dst_x));
-            @memcpy(atlas.bytes[dst_start .. dst_start + @as(usize, @intCast(width))], bytes[src_start .. src_start + @as(usize, @intCast(width))]);
-        }
-
-        atlas.next_x += width;
-        atlas.row_height = @max(atlas.row_height, height);
-        return .{
-            .page = page,
-            .x = dst_x,
-            .y = dst_y,
-            .width = width,
-            .height = height,
-        };
-    }
-};
-
-pub const FontMetrics = extern struct {
-    size: f32 = 0.0,
-    scale: f32 = 1.0,
-    ascent: f32 = 0.0,
-    descent: f32 = 0.0,
-    leading: f32 = 0.0,
-    line_height: f32 = 0.0,
-    atlas_width: u32 = atlas_width,
-    atlas_height: u32 = atlas_height,
-};
-
-pub const GlyphMetric = extern struct {
-    codepoint: u32 = 0,
-    glyph_id: u32 = 0,
-    atlas_x: u32 = 0,
-    atlas_y: u32 = 0,
-    atlas_width: u32 = 0,
-    atlas_height: u32 = 0,
-    offset_x: f32 = 0.0,
-    offset_y: f32 = 0.0,
-    advance: f32 = 0.0,
-    flags: u32 = 0,
-
-    pub fn present(metric: GlyphMetric) bool {
-        return (metric.flags & glyph_present) != 0;
-    }
-
-    pub fn visible(metric: GlyphMetric) bool {
-        return (metric.flags & glyph_visible) != 0 and metric.atlas_width != 0 and metric.atlas_height != 0;
-    }
-};
-
-pub const AtlasRect = extern struct {
-    x: f32 = 0.0,
-    y: f32 = 0.0,
-    width: f32 = 0.0,
-    height: f32 = 0.0,
-};
-
-pub const GlyphInstance = extern struct {
-    rect: layout.Rect = .{},
-    atlas_rect: AtlasRect = .{},
-    color: style.Color = .{},
-    atlas_page: u32 = 0,
-    // Keep GPU-shared padding as scalars. Metal vector3 types have 16-byte
-    // alignment, which does not match a packed host [3]u32 tail.
-    reserved: [3]u32 = .{ 0, 0, 0 },
-};
+pub fn colorForByte(runs: []const TextRun, byte_index: u32) style.Color {
+    return line_mod.colorForByte(runs, byte_index);
+}
 
 pub const Font = struct {
     metrics: FontMetrics = .{},
-    glyphs: [glyph_table_len]GlyphMetric = [_]GlyphMetric{.{}} ** glyph_table_len,
-    resolved_name: [max_resolved_font_name_len + 1]u8 = [_]u8{0} ** (max_resolved_font_name_len + 1),
+    glyphs: [glyph_table_len]GlyphMetric = @splat(.{}),
+    resolved_name: [max_resolved_font_name_len + 1]u8 = @splat(0),
     resolved_name_len: usize = 0,
 
     pub fn glyphForByte(font: *const Font, byte: u8) Error!GlyphMetric {
@@ -268,104 +112,6 @@ pub const Font = struct {
         return font.metrics.line_height;
     }
 };
-
-pub const PushResult = extern struct {
-    advance: f32 = 0.0,
-    glyph_count: u32 = 0,
-};
-
-pub const TextRun = struct {
-    bytes: []const u8,
-    font: FontHandle,
-    size: f32 = default_font_size,
-    color: style.Color,
-};
-
-pub const AsciiRun = struct {
-    bytes: []const u8,
-    color: style.Color,
-    font_slot: u32 = default_font_slot,
-};
-
-pub const LineGlyph = struct {
-    instance: GlyphInstance = .{},
-    byte_index: u32 = 0,
-};
-
-pub const TextLineStorage = struct {
-    glyphs: [max_line_glyphs]LineGlyph = undefined,
-};
-
-pub const TextLine = struct {
-    advance: f32 = 0.0,
-    ascent: f32 = 0.0,
-    descent: f32 = 0.0,
-    leading: f32 = 0.0,
-    line_height: f32 = 0.0,
-    baseline_offset: f32 = 0.0,
-    bytes_len: u32 = 0,
-    glyphs: []const LineGlyph = &.{},
-
-    pub fn xForByte(line: TextLine, byte_index: u32) f32 {
-        var x: f32 = 0.0;
-        for (line.glyphs) |glyph| {
-            if (glyph.byte_index > byte_index) break;
-            x = glyph.instance.rect.x;
-            if (glyph.byte_index == byte_index) return x;
-        }
-        if (byte_index >= line.bytes_len) return line.advance;
-        return x;
-    }
-
-    pub fn byteForX(line: TextLine, x: f32) u32 {
-        var closest: u32 = 0;
-        for (line.glyphs) |glyph| {
-            const left = glyph.instance.rect.x;
-            const right = left + glyph.instance.rect.width;
-            if (x < left) return closest;
-            if (x <= right) return glyph.byte_index;
-            closest = glyph.byte_index;
-        }
-        return line.bytes_len;
-    }
-};
-
-pub const GlyphCacheKey = extern struct {
-    font: FontHandle = .{},
-    glyph_id: u32 = 0,
-    size_bits: u32 = 0,
-    scale_bits: u32 = 0,
-    subpixel_x: u32 = 0,
-};
-
-pub const CachedGlyph = extern struct {
-    key: GlyphCacheKey = .{},
-    atlas_rect: AtlasRect = .{},
-    atlas_page: u32 = 0,
-    width: f32 = 0.0,
-    height: f32 = 0.0,
-    offset_x: f32 = 0.0,
-    offset_y_from_baseline: f32 = 0.0,
-};
-
-pub fn glyphCacheKey(font: FontHandle, glyph_id: u32, size: f32, scale: f32, subpixel_x: u32) GlyphCacheKey {
-    return .{
-        .font = font,
-        .glyph_id = glyph_id,
-        .size_bits = @bitCast(size),
-        .scale_bits = @bitCast(scale),
-        .subpixel_x = subpixel_x,
-    };
-}
-
-pub fn glyphCacheKeyEqual(a: GlyphCacheKey, b: GlyphCacheKey) bool {
-    return a.font.index == b.font.index and
-        a.font.generation == b.font.generation and
-        a.glyph_id == b.glyph_id and
-        a.size_bits == b.size_bits and
-        a.scale_bits == b.scale_bits and
-        a.subpixel_x == b.subpixel_x;
-}
 
 pub const MeasureResult = extern struct {
     advance: f32 = 0.0,
