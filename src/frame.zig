@@ -5,6 +5,8 @@ const scene = @import("scene.zig");
 const text = @import("text.zig");
 const ui = @import("ui.zig");
 
+const TextLine = text.TextLine;
+
 pub const Error = scene.SceneBuildError || ui.layout.LayoutError || error{
     HitCapacityExceeded,
     TextBatchCapacityExceeded,
@@ -97,6 +99,44 @@ pub const Begin = struct {
     fonts: []const text.Font = &.{},
 };
 
+pub const DrawOptions = struct {
+    clip: u32,
+    layer: u32 = scene.layer_content,
+};
+
+pub const Draw = struct {
+    frame: *Frame,
+    clip: u32,
+    layer: u32,
+
+    pub fn fill(draw: *Draw, bounds: ui.layout.Rect, color: ui.style.Color) Error!void {
+        try draw.frame.pushFillDraw(bounds, color, draw.clip, draw.layer);
+    }
+
+    pub fn rect(draw: *Draw, bounds: ui.layout.Rect, style: ui.style.Style) Error!void {
+        try draw.frame.pushStyledRectDraw(bounds, style, draw.clip, draw.layer);
+    }
+
+    pub fn border(draw: *Draw, bounds: ui.layout.Rect, width: f32, color: ui.style.Color) Error!void {
+        try draw.rect(bounds, .{
+            .border = ui.style.Border.solid(width, color),
+        });
+    }
+
+    pub fn rule(draw: *Draw, edge: ui.layout.Edge, bounds: ui.layout.Rect, width: f32, color: ui.style.Color) Error!void {
+        try draw.fill(ruleRect(edge, bounds, width), color);
+    }
+
+    pub fn textLine(draw: *Draw, origin: ui.layout.Point, line: TextLine) Error!void {
+        try draw.frame.flushQuads();
+        try draw.frame.pushTextLine(origin, line, draw.clip, draw.layer);
+    }
+
+    pub fn hit(draw: *Draw, id: ui.hit.HitId, bounds: ui.layout.Rect) Error!void {
+        try draw.frame.pushHit(ui.hit.HitItem.clipped(id, bounds, try draw.frame.clipRect(draw.clip)));
+    }
+};
+
 pub const Storage = struct {
     scene: scene.SceneStorage = undefined,
     layout_results: [scene.max_quads]ui.layout.LayoutResult = undefined,
@@ -141,12 +181,52 @@ pub const Frame = struct {
         };
     }
 
+    pub fn root(frame: *const Frame) ui.layout.Rect {
+        return ui.layout.Rect.init(0.0, 0.0, frame.size[0], frame.size[1]);
+    }
+
+    pub fn drawableClip(frame: *Frame) Error!u32 {
+        return frame.pushDrawableClip();
+    }
+
+    pub fn clip(frame: *Frame, rect: ui.layout.Rect) Error!u32 {
+        const clipped = rect.intersect(frame.root());
+        return frame.pushClip(try renderClip(clipped));
+    }
+
+    pub fn clipRect(frame: *const Frame, clip_index: u32) Error!ui.layout.Rect {
+        if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
+        const rect = frame.storage.scene.clips[@intCast(clip_index)];
+        return ui.layout.Rect.init(
+            @floatFromInt(rect.x),
+            @floatFromInt(rect.y),
+            @floatFromInt(rect.width),
+            @floatFromInt(rect.height),
+        );
+    }
+
+    pub fn cut(frame: *Frame, bounds: ui.layout.Rect, edge: ui.layout.Edge, size: f32) Error!ui.layout.SplitResult {
+        return frame.splitEdge(.{
+            .bounds = bounds,
+            .edge = edge,
+            .size = size,
+        });
+    }
+
+    pub fn draw(frame: *Frame, options: DrawOptions) Draw {
+        return .{
+            .frame = frame,
+            .clip = options.clip,
+            .layer = options.layer,
+        };
+    }
+
     pub fn pushDrawableClip(frame: *Frame) Error!u32 {
         return frame.scene.pushDrawableClip();
     }
 
-    pub fn pushClip(frame: *Frame, clip: scene.ClipRect) Error!u32 {
-        return frame.scene.pushClip(clip);
+    pub fn pushClip(frame: *Frame, clip_rect: scene.ClipRect) Error!u32 {
+        return frame.scene.pushClip(clip_rect);
     }
 
     pub fn beginBatch(frame: *Frame, clip_index: u32) Error!void {
@@ -179,6 +259,28 @@ pub const Frame = struct {
         try frame.beginLayerBatch(clip_index, layer);
         try frame.pushStyledRect(rect, style, clip_index);
         try frame.endBatch();
+    }
+
+    fn pushFillDraw(frame: *Frame, rect: ui.layout.Rect, color: ui.style.Color, clip_index: u32, layer: u32) Error!void {
+        try frame.ensureQuadBatch(clip_index, layer);
+        try frame.pushFill(rect, color, clip_index);
+    }
+
+    fn pushStyledRectDraw(frame: *Frame, rect: ui.layout.Rect, style: ui.style.Style, clip_index: u32, layer: u32) Error!void {
+        try frame.ensureQuadBatch(clip_index, layer);
+        try frame.pushStyledRect(rect, style, clip_index);
+    }
+
+    fn ensureQuadBatch(frame: *Frame, clip_index: u32, layer: u32) Error!void {
+        if (frame.scene.batch_open) {
+            if (frame.scene.open_batch_clip == clip_index and frame.scene.open_batch_layer == layer) return;
+            try frame.endBatch();
+        }
+        try frame.beginLayerBatch(clip_index, layer);
+    }
+
+    fn flushQuads(frame: *Frame) Error!void {
+        if (frame.scene.batch_open) try frame.endBatch();
     }
 
     pub fn pack(frame: *Frame, spec: ui.layout.Pack, items: []const ui.layout.LayoutItem) Error![]const ui.layout.LayoutResult {
@@ -222,7 +324,7 @@ pub const Frame = struct {
         return text.measureAscii(font, bytes);
     }
 
-    pub fn measureTextRuns(frame: *const Frame, runs: []const text.TextRun) Error!text.MeasureResult {
+    pub fn measureTextRuns(frame: *const Frame, runs: []const text.AsciiRun) Error!text.MeasureResult {
         return text.measureAsciiRunsWithFontSet(frame.fontSet(), runs);
     }
 
@@ -265,13 +367,14 @@ pub const Frame = struct {
     }
 
     pub fn pushTextLayer(frame: *Frame, origin: ui.layout.Point, bytes: []const u8, color: ui.style.Color, clip_index: u32, layer: u32) Error!text.PushResult {
-        const runs = [_]text.TextRun{.{ .bytes = bytes, .color = color }};
+        const runs = [_]text.AsciiRun{.{ .bytes = bytes, .color = color }};
         return frame.pushTextRuns(origin, runs[0..], clip_index, layer);
     }
 
-    pub fn pushTextRuns(frame: *Frame, origin: ui.layout.Point, runs: []const text.TextRun, clip_index: u32, layer: u32) Error!text.PushResult {
+    pub fn pushTextRuns(frame: *Frame, origin: ui.layout.Point, runs: []const text.AsciiRun, clip_index: u32, layer: u32) Error!text.PushResult {
         if (frame.fonts.len == 0 and frame.font == null) return text.Error.NoFont;
         if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
+        try frame.flushQuads();
         const used: usize = @intCast(frame.glyph_count);
         const result = try text.pushAsciiRunsWithFontSet(
             frame.fontSet(),
@@ -294,6 +397,34 @@ pub const Frame = struct {
         return result;
     }
 
+    pub fn pushTextLine(frame: *Frame, origin: ui.layout.Point, line: text.TextLine, clip_index: u32, layer: u32) Error!void {
+        if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
+        if (line.glyphs.len == 0) return;
+        try frame.flushQuads();
+
+        const used: usize = @intCast(frame.glyph_count);
+        if (line.glyphs.len > frame.storage.glyphs.len - used) return text.Error.GlyphCapacityExceeded;
+
+        for (line.glyphs, 0..) |glyph, index| {
+            var instance = glyph.instance;
+            instance.rect.x += origin.x;
+            instance.rect.y += origin.y;
+            frame.storage.glyphs[used + index] = instance;
+        }
+
+        if (frame.text_batch_count >= scene.max_text_batches) return Error.TextBatchCapacityExceeded;
+        const batch_index: usize = @intCast(frame.text_batch_count);
+        frame.storage.text_batches[batch_index] = .{
+            .vertex_start = frame.glyph_count * scene.vertices_per_glyph,
+            .vertex_count = @as(u32, @intCast(line.glyphs.len)) * scene.vertices_per_glyph,
+            .clip_index = clip_index,
+            .layer = layer,
+            .order = frame.nextOrder(),
+        };
+        frame.glyph_count += @intCast(line.glyphs.len);
+        frame.text_batch_count += 1;
+    }
+
     fn fontSet(frame: *const Frame) text.FontSet {
         return .{
             .fonts = frame.fonts,
@@ -305,6 +436,7 @@ pub const Frame = struct {
         if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
         if (rect.width <= 0.0 or rect.height <= 0.0) return scene.SceneBuildError.InvalidGeometry;
         if (frame.mask_count >= scene.max_masks) return Error.MaskCapacityExceeded;
+        try frame.flushQuads();
 
         const index: usize = @intCast(frame.mask_count);
         frame.storage.masks[index] = .{
@@ -385,6 +517,23 @@ fn renderRect(rect: ui.layout.Rect) scene.Rect {
     };
 }
 
+fn renderClip(rect: ui.layout.Rect) scene.SceneBuildError!scene.ClipRect {
+    if (!validRect(rect)) return scene.SceneBuildError.InvalidClip;
+
+    const x0 = @floor(rect.x);
+    const y0 = @floor(rect.y);
+    const x1 = @ceil(rect.x + rect.width);
+    const y1 = @ceil(rect.y + rect.height);
+    if (x1 <= x0 or y1 <= y0) return scene.SceneBuildError.InvalidClip;
+
+    return .{
+        .x = try clipCoord(x0),
+        .y = try clipCoord(y0),
+        .width = try clipCoord(x1 - x0),
+        .height = try clipCoord(y1 - y0),
+    };
+}
+
 fn renderColor(color: ui.style.Color) scene.Color {
     return .{ color.r, color.g, color.b, color.a };
 }
@@ -409,6 +558,34 @@ fn renderRadius(radius: ui.style.Radius) scene.Radius {
         .bottom_right = radius.bottom_right,
         .bottom_left = radius.bottom_left,
     };
+}
+
+fn ruleRect(edge: ui.layout.Edge, rect: ui.layout.Rect, width: f32) ui.layout.Rect {
+    const line_width = @max(width, 0.0);
+    return switch (edge) {
+        .left => ui.layout.Rect.init(rect.x, rect.y, line_width, rect.height),
+        .top => ui.layout.Rect.init(rect.x, rect.y, rect.width, line_width),
+        .right => ui.layout.Rect.init(rect.x + @max(rect.width - line_width, 0.0), rect.y, line_width, rect.height),
+        .bottom => ui.layout.Rect.init(rect.x, rect.y + @max(rect.height - line_width, 0.0), rect.width, line_width),
+    };
+}
+
+fn validRect(rect: ui.layout.Rect) bool {
+    return rect.x >= 0.0 and
+        rect.y >= 0.0 and
+        rect.width > 0.0 and
+        rect.height > 0.0 and
+        std.math.isFinite(rect.x) and
+        std.math.isFinite(rect.y) and
+        std.math.isFinite(rect.width) and
+        std.math.isFinite(rect.height);
+}
+
+fn clipCoord(value: f32) scene.SceneBuildError!u32 {
+    const max_exact_u32_f32: f32 = 4_294_967_040.0;
+    if (value < 0.0 or !std.math.isFinite(value)) return scene.SceneBuildError.InvalidClip;
+    if (value >= max_exact_u32_f32) return std.math.maxInt(u32);
+    return @intFromFloat(value);
 }
 
 test "frame owns caller-provided scene storage for one scene" {
@@ -483,6 +660,31 @@ test "frame owns layout scratch and reports capacity errors" {
     try std.testing.expectError(ui.layout.LayoutError.OutputTooSmall, frame.pack(.{
         .bounds = ui.layout.Rect.init(0.0, 0.0, 1.0, 1.0),
     }, too_many[0..]));
+}
+
+test "frame direct API cuts roots clips and coalesces adjacent rects" {
+    var storage: Storage = .{};
+    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 80.0 } });
+
+    const root = frame.root();
+    const clip = try frame.clip(root);
+    const title = try frame.cut(root, .top, 20.0);
+    var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_surface });
+
+    try draw.fill(title.head, ui.style.Color.rgb(0.1, 0.1, 0.1));
+    try draw.rect(title.tail, .{
+        .fill = ui.style.Color.rgb(0.2, 0.2, 0.2),
+        .border = ui.style.Border.solid(1.0, ui.style.Color.rgb(0.8, 0.8, 0.8)),
+    });
+    const out = try frame.finish();
+
+    try std.testing.expectEqual(ui.layout.Rect.init(0.0, 0.0, 100.0, 80.0), root);
+    try std.testing.expectEqual(ui.layout.Rect.init(0.0, 0.0, 100.0, 20.0), title.head);
+    try std.testing.expectEqual(ui.layout.Rect.init(0.0, 20.0, 100.0, 60.0), title.tail);
+    try std.testing.expectEqual(@as(usize, 2), out.quads.len);
+    try std.testing.expectEqual(@as(usize, 1), out.batches.len);
+    try std.testing.expectEqual(@as(u32, scene.vertices_per_quad * 2), out.batches[0].vertex_count);
+    try std.testing.expectEqual(scene.layer_surface, out.batches[0].layer);
 }
 
 test "frame resolves hot id through frame-owned hit stream" {
@@ -603,6 +805,69 @@ test "frame pushes text into a caller-owned glyph stream" {
     try std.testing.expectError(scene.SceneBuildError.InvalidClipIndex, invalid_clip_frame.pushText(.{}, "z", .{}, 0));
 }
 
+test "frame direct API preserves order when text splits rect batches" {
+    var font: text.Font = .{};
+    font.glyphs['z'] = .{
+        .codepoint = 'z',
+        .atlas_width = 5,
+        .atlas_height = 7,
+        .advance = 6.0,
+        .flags = text.glyph_present | text.glyph_visible,
+    };
+
+    var storage: Storage = .{};
+    var frame = Frame.begin(&storage, .{
+        .size = .{ 100.0, 80.0 },
+        .font = &font,
+    });
+    const clip = try frame.clip(frame.root());
+    var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_content });
+
+    try draw.fill(ui.layout.Rect.init(0.0, 0.0, 20.0, 20.0), ui.style.Color.rgb(0.1, 0.1, 0.1));
+    _ = try frame.pushTextLayer(ui.layout.Point.init(4.0, 4.0), "z", ui.style.Color.rgb(0.8, 0.8, 0.8), clip, scene.layer_content);
+    try draw.fill(ui.layout.Rect.init(0.0, 24.0, 20.0, 20.0), ui.style.Color.rgb(0.2, 0.2, 0.2));
+    const out = try frame.finish();
+
+    try std.testing.expectEqual(@as(usize, 2), out.batches.len);
+    try std.testing.expectEqual(@as(usize, 1), out.text_batches.len);
+    try std.testing.expectEqual(@as(u32, 0), out.batches[0].order);
+    try std.testing.expectEqual(@as(u32, 1), out.text_batches[0].order);
+    try std.testing.expectEqual(@as(u32, 2), out.batches[1].order);
+}
+
+test "frame pushes shaped text lines without font lookup" {
+    var storage: Storage = .{};
+    var frame = Frame.begin(&storage, .{ .size = .{ 100.0, 80.0 } });
+    const clip = try frame.clip(frame.root());
+    var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_content });
+
+    var line_storage: text.TextLineStorage = undefined;
+    line_storage.glyphs[0] = .{
+        .instance = .{
+            .rect = ui.layout.Rect.init(1.0, 2.0, 5.0, 7.0),
+            .atlas_rect = .{ .x = 0.1, .y = 0.1, .width = 0.1, .height = 0.1 },
+            .color = ui.style.Color.rgb(0.8, 0.9, 1.0),
+            .atlas_page = 2,
+        },
+        .byte_index = 0,
+    };
+    const line: text.TextLine = .{
+        .advance = 6.0,
+        .line_height = 12.0,
+        .baseline_offset = 9.0,
+        .bytes_len = 1,
+        .glyphs = line_storage.glyphs[0..1],
+    };
+
+    try draw.textLine(ui.layout.Point.init(10.0, 20.0), line);
+    const out = try frame.finish();
+
+    try std.testing.expectEqual(@as(usize, 1), out.glyphs.len);
+    try std.testing.expectEqual(ui.layout.Rect.init(11.0, 22.0, 5.0, 7.0), out.glyphs[0].rect);
+    try std.testing.expectEqual(@as(u32, 2), out.glyphs[0].atlas_page);
+    try std.testing.expectEqual(@as(usize, 1), out.text_batches.len);
+}
+
 test "frame text runs emit one batch with per glyph colors" {
     var font: text.Font = .{};
     font.metrics = .{
@@ -631,7 +896,7 @@ test "frame text runs emit one batch with per glyph colors" {
         .font = &font,
     });
     const clip = try frame.pushDrawableClip();
-    const runs = [_]text.TextRun{
+    const runs = [_]text.AsciiRun{
         .{ .bytes = "a", .color = ui.style.Color.rgb(1.0, 0.0, 0.0) },
         .{ .bytes = "b", .color = ui.style.Color.rgb(0.0, 1.0, 0.0) },
     };
@@ -672,7 +937,7 @@ test "frame text runs can select fixed font slots" {
         .fonts = fonts[0..],
     });
     const clip = try frame.pushDrawableClip();
-    const runs = [_]text.TextRun{
+    const runs = [_]text.AsciiRun{
         .{ .bytes = "a", .color = ui.style.Color.rgb(1.0, 1.0, 1.0), .font_slot = 0 },
         .{ .bytes = "b", .color = ui.style.Color.rgb(0.8, 0.8, 0.8), .font_slot = 1 },
     };
@@ -683,8 +948,8 @@ test "frame text runs can select fixed font slots" {
 
     try std.testing.expectEqual(@as(f32, 14.0), measured.advance);
     try std.testing.expectEqual(@as(f32, 18.0), measured.height);
-    try std.testing.expectEqual(@as(u32, 0), out.glyphs[0].font_slot);
-    try std.testing.expectEqual(@as(u32, 1), out.glyphs[1].font_slot);
+    try std.testing.expectEqual(@as(u32, 0), out.glyphs[0].atlas_page);
+    try std.testing.expectEqual(@as(u32, 1), out.glyphs[1].atlas_page);
     try std.testing.expectEqual(ui.layout.Rect.init(5.0, 0.0, 8.0, 10.0), out.glyphs[1].rect);
 }
 

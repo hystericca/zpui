@@ -6,10 +6,12 @@ pub const ui = @import("ui.zig");
 
 pub const FrameData = scene.FrameData;
 pub const Font = text.Font;
-pub const FontOptions = text.FontOptions;
+pub const FontHandle = text.FontHandle;
+pub const FontInfo = text.FontInfo;
+pub const FontLoadOptions = text.FontLoadOptions;
 pub const FontVariation = text.FontVariation;
-pub const default_font_slot = text.default_font_slot;
-pub const max_font_slots = text.max_font_slots;
+pub const Draw = frame.Draw;
+pub const DrawOptions = frame.DrawOptions;
 pub const Frame = frame.Frame;
 pub const FrameStorage = frame.Storage;
 pub const MaskAtlasRect = mask.AtlasRect;
@@ -19,6 +21,8 @@ pub const Scene = scene.Scene;
 pub const SceneBuilder = scene.SceneBuilder;
 pub const SceneStorage = scene.SceneStorage;
 pub const TextMetrics = text.TextMetrics;
+pub const TextLine = text.TextLine;
+pub const TextLineStorage = text.TextLineStorage;
 pub const RowTextPlacement = text.RowTextPlacement;
 
 pub fn fontAxis(comptime tag: []const u8) u32 {

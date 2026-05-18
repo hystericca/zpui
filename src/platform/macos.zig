@@ -235,22 +235,28 @@ pub const DrawContext = opaque {
         return @ptrCast(@alignCast(ptr));
     }
 
-    pub fn setFont(ctx: *DrawContext, options: text.FontOptions) surface.Error!void {
-        const native_ctx = ctx.native();
-        try native_ctx.surface.setFont(options);
+    pub fn defaultFont(ctx: *DrawContext) text.FontHandle {
+        return ctx.native().surface.defaultFont();
     }
 
-    pub fn setFontSlot(ctx: *DrawContext, slot: u32, options: text.FontOptions) surface.Error!void {
-        const native_ctx = ctx.native();
-        try native_ctx.surface.setFontSlot(slot, options);
+    pub fn loadSystemFont(ctx: *DrawContext, name: [:0]const u8, options: text.FontLoadOptions) surface.Error!text.FontHandle {
+        return ctx.native().surface.loadSystemFont(name, options);
     }
 
-    pub fn resolvedFontName(ctx: *DrawContext) []const u8 {
-        return ctx.native().surface.resolvedFontName();
+    pub fn loadFontFile(ctx: *DrawContext, path: [:0]const u8, options: text.FontLoadOptions) surface.Error!text.FontHandle {
+        return ctx.native().surface.loadFontFile(path, options);
     }
 
-    pub fn resolvedFontNameSlot(ctx: *DrawContext, slot: u32) surface.Error![]const u8 {
-        return ctx.native().surface.resolvedFontNameSlot(slot);
+    pub fn loadFontBytes(ctx: *DrawContext, bytes: []const u8, options: text.FontLoadOptions) surface.Error!text.FontHandle {
+        return ctx.native().surface.loadFontBytes(bytes, options);
+    }
+
+    pub fn fontInfo(ctx: *DrawContext, handle: text.FontHandle) surface.Error!text.FontInfo {
+        return ctx.native().surface.fontInfo(handle);
+    }
+
+    pub fn shapeLine(ctx: *DrawContext, storage: *text.TextLineStorage, runs: []const text.TextRun) surface.Error!text.TextLine {
+        return ctx.native().surface.shapeLine(storage, runs);
     }
 
     pub fn maskAtlas(ctx: *DrawContext) *const mask.AtlasStorage {
@@ -285,8 +291,6 @@ pub const DrawContext = opaque {
             .scale = scale,
             .clear_color = options.clear_color,
             .input = input_snapshot,
-            .font = &native_ctx.surface.fonts()[0],
-            .fonts = native_ctx.surface.fonts(),
         });
     }
 
@@ -373,14 +377,6 @@ pub fn initWindow(options: WindowOptions) Error!void {
         2 => Error.MetalUnavailable,
         else => Error.CocoaStartupFailed,
     };
-}
-
-pub fn registerFontFile(path: [:0]const u8) macos_text.Error!void {
-    try macos_text.registerFontFile(path);
-}
-
-pub fn registerFontBytes(bytes: []const u8) macos_text.Error!void {
-    try macos_text.registerFontBytes(bytes);
 }
 
 fn drawClear(ctx: *DrawContext) DrawError!void {

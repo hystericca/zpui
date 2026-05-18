@@ -20,19 +20,19 @@ pub const Error = mtl.Error || error{
     InvalidClipRect,
     InvalidFontOptions,
     InvalidFontSlot,
+    InvalidFontHandle,
     OutOfMemory,
-} || mask.Error || macos_text.Error;
+} || mask.Error || macos_text.Error || text.Error;
 
 pub const max_frames_in_flight = 3;
 pub const frame_quad_cap = scene.max_quads;
 pub const frame_buf_len = @sizeOf(scene.FrameData);
 pub const text_frame_buf_len = @sizeOf(scene.TextFrameData);
 pub const mask_frame_buf_len = @sizeOf(scene.MaskFrameData);
-pub const font_slot_count = text.max_font_slots;
 const frame_wait_timeout_ms = 10;
 const frame_drain_timeout_ms = 5_000;
-const mask_texture_index = text.max_font_slots;
-const residency_allocation_cap = max_frames_in_flight * 3 + text.max_font_slots + 1;
+const mask_texture_index = text.max_atlas_pages;
+const residency_allocation_cap = max_frames_in_flight * 3 + text.max_atlas_pages + 1;
 
 pub const Options = struct {
     layer: mtl.layer.Config = .{},
@@ -67,6 +67,25 @@ const Draw = struct {
     mask_vertex_count: u32,
     mask_batch_count: u32,
     command_count: u32,
+};
+
+const FontRecord = struct {
+    platform: macos_text.PlatformFont = .{},
+    generation: u32 = 0,
+    occupied: bool = false,
+
+    fn handle(record: *const FontRecord, index: usize) text.FontHandle {
+        return .{ .index = @intCast(index), .generation = record.generation };
+    }
+
+    fn info(record: *const FontRecord) text.FontInfo {
+        return .{
+            .postscript_name = record.platform.postscript_name[0..record.platform.postscript_name_len],
+            .family_name = record.platform.family_name[0..record.platform.family_name_len],
+            .display_name = record.platform.display_name[0..record.platform.display_name_len],
+            .axes = record.platform.axes[0..record.platform.axis_count],
+        };
+    }
 };
 
 pub const Status = enum(c_int) {
@@ -126,6 +145,11 @@ pub const Status = enum(c_int) {
     invalid_mask = 62,
     mask_atlas_full = 63,
     mask_entry_capacity_exceeded = 64,
+    invalid_font_handle = 65,
+    invalid_utf8 = 66,
+    text_line_glyph_capacity_exceeded = 67,
+    glyph_cache_capacity_exceeded = 68,
+    glyph_raster_too_large = 69,
 
     pub fn fromError(err: Error) Status {
         return switch (err) {
@@ -172,10 +196,23 @@ pub const Status = enum(c_int) {
             Error.InvalidClipRect => .invalid_clip_rect,
             Error.InvalidFontOptions => .invalid_font_options,
             Error.InvalidFontSlot => .invalid_font_slot,
+            Error.InvalidFontHandle => .invalid_font_handle,
+            Error.NoFont => .invalid_font_handle,
+            Error.FontCapacityExceeded => .invalid_font_handle,
             Error.FontUnavailable => .font_unavailable,
             Error.FontVariationUnavailable => .font_variation_unavailable,
             Error.FontRegistrationFailed => .font_registration_failed,
             Error.InvalidFontData => .invalid_font_data,
+            Error.InvalidUtf8 => .invalid_utf8,
+            Error.LineGlyphCapacityExceeded => .text_line_glyph_capacity_exceeded,
+            Error.GlyphCapacityExceeded => .text_line_glyph_capacity_exceeded,
+            Error.CachedGlyphCapacityExceeded => .glyph_cache_capacity_exceeded,
+            Error.RasterTooLarge => .glyph_raster_too_large,
+            Error.MissingGlyph,
+            Error.UnsupportedCodepoint,
+            Error.InvalidAtlas,
+            Error.ShapingFailed,
+            => .frame_encoding_failed,
             Error.InvalidMaskId => .invalid_mask_id,
             Error.InvalidMask => .invalid_mask,
             Error.AtlasFull => .mask_atlas_full,
@@ -199,15 +236,15 @@ pub const Surface = struct {
     frames: [max_frames_in_flight]GpuFrame,
     draw_commands: [scene.max_draw_commands]scene.DrawCommand = undefined,
     frame_storage: ui_frame.Storage = .{},
-    text_fonts: [text.max_font_slots]text.Font = [_]text.Font{.{}} ** text.max_font_slots,
-    text_atlases: [text.max_font_slots]text.AtlasStorage = [_]text.AtlasStorage{.{}} ** text.max_font_slots,
+    font_records: [text.max_fonts]FontRecord = [_]FontRecord{.{}} ** text.max_fonts,
+    glyph_cache: [text.max_cached_glyphs]text.CachedGlyph = [_]text.CachedGlyph{.{}} ** text.max_cached_glyphs,
+    glyph_cache_count: u32 = 0,
+    glyph_atlases: [text.max_atlas_pages]text.GlyphAtlasStorage = [_]text.GlyphAtlasStorage{.{}} ** text.max_atlas_pages,
+    raster_scratch: [text.max_raster_byte_len]u8 = [_]u8{0} ** text.max_raster_byte_len,
+    raw_text_runs: [text.max_line_runs]macos_text.RawTextRun = undefined,
+    raw_shaped_glyphs: [text.max_line_glyphs]macos_text.RawShapedGlyph = undefined,
     mask_atlas: mask.AtlasStorage = .{},
-    font_families: [text.max_font_slots][text.max_font_family_len + 1]u8 = [_][text.max_font_family_len + 1]u8{[_]u8{0} ** (text.max_font_family_len + 1)} ** text.max_font_slots,
-    font_family_lens: [text.max_font_slots]usize = [_]usize{0} ** text.max_font_slots,
-    font_sizes: [text.max_font_slots]f32 = [_]f32{text.default_font_size} ** text.max_font_slots,
-    font_variations: [text.max_font_slots][text.max_font_variations]text.FontVariation = [_][text.max_font_variations]text.FontVariation{[_]text.FontVariation{.{}} ** text.max_font_variations} ** text.max_font_slots,
-    font_variation_lens: [text.max_font_slots]usize = [_]usize{0} ** text.max_font_slots,
-    text_textures: [text.max_font_slots]mtl.resource.OwnedTexture,
+    text_textures: [text.max_atlas_pages]mtl.resource.OwnedTexture,
     mask_texture: mtl.resource.OwnedTexture,
     text_sampler: mtl.resource.OwnedSamplerState,
     argument_table: mtl.resource.OwnedArgumentTable,
@@ -232,7 +269,6 @@ pub const Surface = struct {
     pub fn createWithOptions(alloc: std.mem.Allocator, device: ObjCId, options: Options) Error!*Surface {
         const config = options.layer;
         const default_font = text.FontOptions{};
-        const font_family = try storeFontFamily(default_font.family);
 
         const device_ref = mtl.Device.fromRaw(device orelse return Error.InvalidDevice);
         var owned_device = try mtl.retain(.device, device_ref);
@@ -271,32 +307,30 @@ pub const Surface = struct {
             command_allocators[allocator_count] = try mtl.command.createAllocator(owned_device.ref());
         }
 
-        var text_fonts: [text.max_font_slots]text.Font = [_]text.Font{.{}} ** text.max_font_slots;
-        var text_atlases: [text.max_font_slots]text.AtlasStorage = [_]text.AtlasStorage{.{}} ** text.max_font_slots;
-        var text_textures: [text.max_font_slots]mtl.resource.OwnedTexture = undefined;
+        var text_textures: [text.max_atlas_pages]mtl.resource.OwnedTexture = undefined;
         var text_texture_count: usize = 0;
         errdefer {
             for (text_textures[0..text_texture_count]) |*texture| {
                 texture.deinit();
             }
         }
-        while (text_texture_count < text.max_font_slots) : (text_texture_count += 1) {
-            try buildTextAtlas(&text_fonts[text_texture_count], &text_atlases[text_texture_count], default_font, 2.0);
-            text_textures[text_texture_count] = try createTextTexture(owned_device.ref(), &text_atlases[text_texture_count]);
+        while (text_texture_count < text.max_atlas_pages) : (text_texture_count += 1) {
+            text_textures[text_texture_count] = try createGlyphTexture(owned_device.ref());
         }
 
-        var font_families: [text.max_font_slots][text.max_font_family_len + 1]u8 = undefined;
-        var font_family_lens: [text.max_font_slots]usize = undefined;
-        var font_sizes: [text.max_font_slots]f32 = undefined;
-        var font_variations: [text.max_font_slots][text.max_font_variations]text.FontVariation = undefined;
-        var font_variation_lens: [text.max_font_slots]usize = undefined;
-        for (0..text.max_font_slots) |slot| {
-            font_families[slot] = font_family;
-            font_family_lens[slot] = default_font.family.len;
-            font_sizes[slot] = default_font.size;
-            font_variations[slot] = [_]text.FontVariation{.{}} ** text.max_font_variations;
-            font_variation_lens[slot] = 0;
+        var font_records: [text.max_fonts]FontRecord = [_]FontRecord{.{}} ** text.max_fonts;
+        var loaded_font_count: usize = 0;
+        errdefer {
+            for (font_records[0..loaded_font_count]) |*record| {
+                if (record.occupied) macos_text.releaseFont(&record.platform);
+            }
         }
+        font_records[0] = .{
+            .platform = try macos_text.loadSystemFont(default_font.family, .{}),
+            .generation = 1,
+            .occupied = true,
+        };
+        loaded_font_count = 1;
 
         var mask_atlas: mask.AtlasStorage = .{};
         var mask_texture = try createMaskTexture(owned_device.ref(), &mask_atlas);
@@ -337,7 +371,7 @@ pub const Surface = struct {
 
         var argument_table = try mtl.resource.createArgumentTableWithConfig(owned_device.ref(), .{
             .max_buffer_bind_count = 3,
-            .max_texture_bind_count = text.max_font_slots + 1,
+            .max_texture_bind_count = text.max_atlas_pages + 1,
             .max_sampler_state_bind_count = 1,
         });
         errdefer argument_table.deinit();
@@ -365,14 +399,14 @@ pub const Surface = struct {
             .frames = frames,
             .draw_commands = undefined,
             .frame_storage = .{},
-            .text_fonts = text_fonts,
-            .text_atlases = text_atlases,
+            .font_records = font_records,
+            .glyph_cache = [_]text.CachedGlyph{.{}} ** text.max_cached_glyphs,
+            .glyph_cache_count = 0,
+            .glyph_atlases = [_]text.GlyphAtlasStorage{.{}} ** text.max_atlas_pages,
+            .raster_scratch = [_]u8{0} ** text.max_raster_byte_len,
+            .raw_text_runs = undefined,
+            .raw_shaped_glyphs = undefined,
             .mask_atlas = mask_atlas,
-            .font_families = font_families,
-            .font_family_lens = font_family_lens,
-            .font_sizes = font_sizes,
-            .font_variations = font_variations,
-            .font_variation_lens = font_variation_lens,
             .text_textures = text_textures,
             .mask_texture = mask_texture,
             .text_sampler = text_sampler,
@@ -406,6 +440,9 @@ pub const Surface = struct {
         for (&surface.text_textures) |*texture| {
             texture.deinit();
         }
+        for (&surface.font_records) |*record| {
+            if (record.occupied) macos_text.releaseFont(&record.platform);
+        }
         surface.mask_pipeline_state.deinit();
         surface.text_pipeline_state.deinit();
         surface.pipeline_state.deinit();
@@ -414,32 +451,6 @@ pub const Surface = struct {
         surface.layer.deinit();
         surface.device.deinit();
         alloc.destroy(surface);
-    }
-
-    pub fn fonts(surface: *const Surface) []const text.Font {
-        return surface.text_fonts[0..];
-    }
-
-    fn fontOptions(surface: *const Surface, slot: u32) Error!text.FontOptions {
-        const index = try fontSlotIndex(slot);
-        return .{
-            .family = surface.font_families[index][0..surface.font_family_lens[index] :0],
-            .size = surface.font_sizes[index],
-            .variations = surface.font_variations[index][0..surface.font_variation_lens[index]],
-        };
-    }
-
-    pub fn resolvedFontName(surface: *const Surface) []const u8 {
-        return surface.resolvedFontNameSlot(text.default_font_slot) catch "";
-    }
-
-    pub fn resolvedFontNameSlot(surface: *const Surface, slot: u32) Error![]const u8 {
-        const index = try fontSlotIndex(slot);
-        return surface.text_fonts[index].resolvedName();
-    }
-
-    pub fn setFont(surface: *Surface, options: text.FontOptions) Error!void {
-        try surface.setFontSlot(text.default_font_slot, options);
     }
 
     pub fn maskAtlas(surface: *const Surface) *const mask.AtlasStorage {
@@ -457,32 +468,205 @@ pub const Surface = struct {
         uploadMaskAtlas(surface.mask_texture.ref(), &surface.mask_atlas);
     }
 
-    pub fn setFontSlot(surface: *Surface, slot: u32, options: text.FontOptions) Error!void {
-        const index = try fontSlotIndex(slot);
-        if (!options.valid()) return Error.InvalidFontOptions;
-        if (surface.font_sizes[index] == options.size and
-            std.mem.eql(u8, surface.font_families[index][0..surface.font_family_lens[index]], options.family) and
-            fontVariationsEqual(surface.font_variations[index][0..surface.font_variation_lens[index]], options.variations))
-        {
-            return;
+    pub fn defaultFont(surface: *const Surface) text.FontHandle {
+        const record = &surface.font_records[0];
+        if (!record.occupied) return .{};
+        return record.handle(0);
+    }
+
+    pub fn loadSystemFont(surface: *Surface, name: [:0]const u8, options: text.FontLoadOptions) Error!text.FontHandle {
+        if (name.len == 0 or name.len > text.max_resolved_font_name_len) return Error.InvalidFontOptions;
+        const platform_font = try macos_text.loadSystemFont(name, options);
+        errdefer {
+            var owned = platform_font;
+            macos_text.releaseFont(&owned);
+        }
+        return surface.addFont(platform_font);
+    }
+
+    pub fn loadFontFile(surface: *Surface, path: [:0]const u8, options: text.FontLoadOptions) Error!text.FontHandle {
+        const platform_font = try macos_text.loadFontFile(path, options);
+        errdefer {
+            var owned = platform_font;
+            macos_text.releaseFont(&owned);
+        }
+        return surface.addFont(platform_font);
+    }
+
+    pub fn loadFontBytes(surface: *Surface, bytes: []const u8, options: text.FontLoadOptions) Error!text.FontHandle {
+        const platform_font = try macos_text.loadFontBytes(bytes, options);
+        errdefer {
+            var owned = platform_font;
+            macos_text.releaseFont(&owned);
+        }
+        return surface.addFont(platform_font);
+    }
+
+    pub fn fontInfo(surface: *const Surface, handle: text.FontHandle) Error!text.FontInfo {
+        const index = try surface.fontIndex(handle);
+        return surface.font_records[index].info();
+    }
+
+    pub fn shapeLine(surface: *Surface, storage: *text.TextLineStorage, runs: []const text.TextRun) Error!text.TextLine {
+        if (runs.len == 0 or runs.len > text.max_line_runs) return Error.InvalidFontOptions;
+
+        var byte_len: usize = 0;
+        for (runs, 0..) |run, index| {
+            if (run.bytes.len == 0 or !std.unicode.utf8ValidateSlice(run.bytes)) return Error.InvalidUtf8;
+            if (run.size <= 0.0 or !std.math.isFinite(run.size)) return Error.InvalidFontOptions;
+            const font_index = try surface.fontIndex(run.font);
+            const record = surface.font_records[font_index];
+            surface.raw_text_runs[index] = .{
+                .bytes = run.bytes.ptr,
+                .len = run.bytes.len,
+                .descriptor = record.platform.descriptor,
+                .font_index = run.font.index,
+                .font_generation = run.font.generation,
+                .size = run.size,
+                .color = .{ run.color.r, run.color.g, run.color.b, run.color.a },
+            };
+            byte_len += run.bytes.len;
+            if (byte_len > std.math.maxInt(u32)) return Error.InvalidUtf8;
         }
 
-        const next_family = try storeFontFamily(options.family);
-        const next_variations = try storeFontVariations(options.variations);
-        const scale32: f32 = @floatCast(surface.scale);
-        var next_font: text.Font = .{};
-        var next_atlas: text.AtlasStorage = .{};
-        try buildTextAtlas(&next_font, &next_atlas, options, scale32);
+        const metrics = try macos_text.shapeLine(surface.raw_text_runs[0..runs.len], surface.raw_shaped_glyphs[0..]);
+        if (metrics.glyph_count > storage.glyphs.len) return Error.LineGlyphCapacityExceeded;
 
-        surface.drain();
-        surface.text_fonts[index] = next_font;
-        surface.text_atlases[index] = next_atlas;
-        surface.font_families[index] = next_family;
-        surface.font_family_lens[index] = options.family.len;
-        surface.font_sizes[index] = options.size;
-        surface.font_variations[index] = next_variations;
-        surface.font_variation_lens[index] = options.variations.len;
-        uploadTextAtlas(surface.text_textures[index].ref(), &surface.text_atlases[index]);
+        const glyph_count: usize = @intCast(metrics.glyph_count);
+        var visible_count: usize = 0;
+        for (surface.raw_shaped_glyphs[0..glyph_count]) |raw| {
+            const handle: text.FontHandle = .{ .index = raw.font_index, .generation = raw.font_generation };
+            const cached = try surface.ensureGlyph(handle, raw.glyph_id, raw.size, raw.x);
+            if (cached.width == 0.0 or cached.height == 0.0) continue;
+            storage.glyphs[visible_count] = .{
+                .instance = .{
+                    .rect = .{
+                        .x = raw.x + cached.offset_x,
+                        .y = metrics.baseline_offset + raw.y + cached.offset_y_from_baseline,
+                        .width = cached.width,
+                        .height = cached.height,
+                    },
+                    .atlas_rect = cached.atlas_rect,
+                    .color = .{ .r = raw.color[0], .g = raw.color[1], .b = raw.color[2], .a = raw.color[3] },
+                    .atlas_page = cached.atlas_page,
+                },
+                .byte_index = raw.byte_index,
+            };
+            visible_count += 1;
+        }
+
+        return .{
+            .advance = metrics.advance,
+            .ascent = metrics.ascent,
+            .descent = metrics.descent,
+            .leading = metrics.leading,
+            .line_height = metrics.line_height,
+            .baseline_offset = metrics.baseline_offset,
+            .bytes_len = metrics.bytes_len,
+            .glyphs = storage.glyphs[0..visible_count],
+        };
+    }
+
+    fn addFont(surface: *Surface, platform_font: macos_text.PlatformFont) Error!text.FontHandle {
+        for (&surface.font_records, 0..) |*record, index| {
+            if (!record.occupied) {
+                record.* = .{
+                    .platform = platform_font,
+                    .generation = if (record.generation == 0) 1 else record.generation +% 1,
+                    .occupied = true,
+                };
+                if (record.generation == 0) record.generation = 1;
+                return record.handle(index);
+            }
+        }
+        return Error.FontCapacityExceeded;
+    }
+
+    fn fontIndex(surface: *const Surface, handle: text.FontHandle) Error!usize {
+        if (!handle.valid()) return Error.InvalidFontHandle;
+        const index: usize = @intCast(handle.index);
+        if (index >= surface.font_records.len) return Error.InvalidFontHandle;
+        const record = surface.font_records[index];
+        if (!record.occupied or record.generation != handle.generation or record.platform.descriptor == null) return Error.InvalidFontHandle;
+        return index;
+    }
+
+    fn ensureGlyph(surface: *Surface, font: text.FontHandle, glyph_id: u32, size: f32, x: f32) Error!text.CachedGlyph {
+        const scale32: f32 = @floatCast(@max(surface.scale, 1.0));
+        const physical_x = x * scale32;
+        const fraction = physical_x - @floor(physical_x);
+        const subpixel_x: u32 = @intFromFloat(@min(@floor(fraction * 4.0), 3.0));
+        const subpixel_offset = @as(f32, @floatFromInt(subpixel_x)) * 0.25;
+        const key = text.glyphCacheKey(font, glyph_id, size, scale32, subpixel_x);
+        for (surface.glyph_cache[0..@intCast(surface.glyph_cache_count)]) |cached| {
+            if (text.glyphCacheKeyEqual(cached.key, key)) return cached;
+        }
+        if (surface.glyph_cache_count >= text.max_cached_glyphs) return Error.CachedGlyphCapacityExceeded;
+
+        const font_index = try surface.fontIndex(font);
+        const record = &surface.font_records[font_index];
+        const raster = try macos_text.rasterizeGlyph(
+            record.platform.descriptor,
+            glyph_id,
+            size,
+            scale32,
+            subpixel_offset,
+            surface.raster_scratch[0..],
+        );
+        if (raster.width == 0 or raster.height == 0) {
+            const cached: text.CachedGlyph = .{
+                .key = key,
+                .atlas_page = 0,
+            };
+            surface.glyph_cache[@intCast(surface.glyph_cache_count)] = cached;
+            surface.glyph_cache_count += 1;
+            return cached;
+        }
+
+        var packed_glyph: ?text.PackedGlyph = null;
+        for (&surface.glyph_atlases, 0..) |*atlas, page| {
+            packed_glyph = atlas.append(@intCast(page), raster.width, raster.height, surface.raster_scratch[0 .. @as(usize, @intCast(raster.bytes_per_row)) * @as(usize, @intCast(raster.height))], raster.bytes_per_row) catch |err| switch (err) {
+                error.AtlasFull => null,
+                else => return err,
+            };
+            if (packed_glyph != null) break;
+        }
+        const placed = packed_glyph orelse return Error.AtlasFull;
+        surface.uploadGlyph(placed);
+
+        const cached: text.CachedGlyph = .{
+            .key = key,
+            .atlas_rect = .{
+                .x = @as(f32, @floatFromInt(placed.x)) / @as(f32, @floatFromInt(text.glyph_atlas_width)),
+                .y = @as(f32, @floatFromInt(placed.y)) / @as(f32, @floatFromInt(text.glyph_atlas_height)),
+                .width = @as(f32, @floatFromInt(placed.width)) / @as(f32, @floatFromInt(text.glyph_atlas_width)),
+                .height = @as(f32, @floatFromInt(placed.height)) / @as(f32, @floatFromInt(text.glyph_atlas_height)),
+            },
+            .atlas_page = placed.page,
+            .width = raster.logical_width,
+            .height = raster.logical_height,
+            .offset_x = raster.offset_x,
+            .offset_y_from_baseline = raster.offset_y_from_baseline,
+        };
+        surface.glyph_cache[@intCast(surface.glyph_cache_count)] = cached;
+        surface.glyph_cache_count += 1;
+        return cached;
+    }
+
+    fn uploadGlyph(surface: *Surface, glyph: text.PackedGlyph) void {
+        const page: usize = @intCast(glyph.page);
+        const atlas = &surface.glyph_atlases[page];
+        const start = @as(usize, @intCast(glyph.y)) * text.glyph_atlas_width + @as(usize, @intCast(glyph.x));
+        mtl.resource.replaceRegion(
+            surface.text_textures[page].ref(),
+            .{
+                .origin = .{ .x = glyph.x, .y = glyph.y, .z = 0 },
+                .size = .{ .width = glyph.width, .height = glyph.height, .depth = 1 },
+            },
+            0,
+            atlas.bytes[start..].ptr,
+            text.glyph_atlas_width,
+        );
     }
 
     pub fn resize(surface: *Surface, drawable_size: mtl.abi.Size2D, scale: mtl.abi.CGFloat) Error!void {
@@ -493,18 +677,13 @@ pub const Surface = struct {
             return;
         }
 
+        const old_scale: f32 = @floatCast(@max(surface.scale, 1.0));
+        const next_scale: f32 = @floatCast(@max(scale, 1.0));
         try mtl.layer.resize(surface.layer.ref(), drawable_size, scale);
-        const scale32: f32 = @floatCast(scale);
-        if (surface.text_fonts[0].metrics.scale != scale32) {
+        if (old_scale != next_scale) {
             surface.drain();
-            for (0..text.max_font_slots) |index| {
-                var next_font: text.Font = .{};
-                var next_atlas: text.AtlasStorage = .{};
-                try buildTextAtlas(&next_font, &next_atlas, try surface.fontOptions(@intCast(index)), scale32);
-                surface.text_fonts[index] = next_font;
-                surface.text_atlases[index] = next_atlas;
-                uploadTextAtlas(surface.text_textures[index].ref(), &surface.text_atlases[index]);
-            }
+            surface.glyph_cache_count = 0;
+            for (&surface.glyph_atlases) |*atlas| atlas.clear();
         }
         surface.drawable_size = drawable_size;
         surface.scale = scale;
@@ -784,18 +963,14 @@ fn bufferContentsAs(buffer: mtl.resource.Buffer, comptime T: type) Error!*T {
     return @ptrCast(@alignCast(bytes));
 }
 
-fn createTextTexture(device: mtl.Device, atlas: *const text.AtlasStorage) Error!mtl.resource.OwnedTexture {
-    var texture = try mtl.resource.createTexture(device, .{
-        .width = text.atlas_width,
-        .height = text.atlas_height,
+fn createGlyphTexture(device: mtl.Device) Error!mtl.resource.OwnedTexture {
+    return mtl.resource.createTexture(device, .{
+        .width = text.glyph_atlas_width,
+        .height = text.glyph_atlas_height,
         .pixel_format = .r8_unorm,
         .usage = mtl.abi.texture_usage_shader_read,
         .storage_mode = .shared,
     });
-    errdefer texture.deinit();
-
-    uploadTextAtlas(texture.ref(), atlas);
-    return texture;
 }
 
 fn createMaskTexture(device: mtl.Device, atlas: *const mask.AtlasStorage) Error!mtl.resource.OwnedTexture {
@@ -810,19 +985,6 @@ fn createMaskTexture(device: mtl.Device, atlas: *const mask.AtlasStorage) Error!
 
     uploadMaskAtlas(texture.ref(), atlas);
     return texture;
-}
-
-fn uploadTextAtlas(texture: mtl.resource.Texture, atlas: *const text.AtlasStorage) void {
-    mtl.resource.replaceRegion(
-        texture,
-        .{
-            .origin = .{ .x = 0, .y = 0, .z = 0 },
-            .size = .{ .width = text.atlas_width, .height = text.atlas_height, .depth = 1 },
-        },
-        0,
-        atlas.bytes[0..].ptr,
-        text.atlas_width,
-    );
 }
 
 fn uploadMaskAtlas(texture: mtl.resource.Texture, atlas: *const mask.AtlasStorage) void {
@@ -904,47 +1066,6 @@ fn toClearColor(color: [4]f64) mtl.abi.ClearColor {
         .blue = color[2],
         .alpha = color[3],
     };
-}
-
-fn storeFontFamily(family: [:0]const u8) Error![text.max_font_family_len + 1]u8 {
-    if (family.len == 0 or family.len > text.max_font_family_len) return Error.InvalidFontOptions;
-
-    var stored = [_]u8{0} ** (text.max_font_family_len + 1);
-    @memcpy(stored[0..family.len], family);
-    return stored;
-}
-
-fn storeFontVariations(variations: []const text.FontVariation) Error![text.max_font_variations]text.FontVariation {
-    if (variations.len > text.max_font_variations) return Error.InvalidFontOptions;
-
-    var stored = [_]text.FontVariation{.{}} ** text.max_font_variations;
-    for (variations, 0..) |variation, index| {
-        if (!variation.valid()) return Error.InvalidFontOptions;
-        for (variations[0..index]) |previous| {
-            if (previous.tag == variation.tag) return Error.InvalidFontOptions;
-        }
-        stored[index] = variation;
-    }
-    return stored;
-}
-
-fn fontVariationsEqual(a: []const text.FontVariation, b: []const text.FontVariation) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |lhs, rhs| {
-        if (lhs.tag != rhs.tag or lhs.value != rhs.value) return false;
-    }
-    return true;
-}
-
-fn fontSlotIndex(slot: u32) Error!usize {
-    const index: usize = @intCast(slot);
-    if (index >= text.max_font_slots) return Error.InvalidFontSlot;
-    return index;
-}
-
-fn buildTextAtlas(font: *text.Font, atlas: *text.AtlasStorage, options: text.FontOptions, scale: f32) Error!void {
-    if (!options.valid() or scale <= 0.0 or !std.math.isFinite(scale)) return Error.InvalidFontOptions;
-    try macos_text.buildAsciiAtlas(font, atlas, options, scale);
 }
 
 pub export fn zpui_surface_create(device: ObjCId, out_surface: *?*Surface) c_int {
@@ -1073,7 +1194,7 @@ test "surface frame buffer capacity matches the scene contract" {
     try std.testing.expectEqual(@sizeOf(scene.FrameData), frame_buf_len);
     try std.testing.expectEqual(@sizeOf(scene.TextFrameData), text_frame_buf_len);
     try std.testing.expectEqual(@sizeOf(scene.MaskFrameData), mask_frame_buf_len);
-    try std.testing.expectEqual(@as(usize, max_frames_in_flight * 3 + text.max_font_slots + 1), residency_allocation_cap);
+    try std.testing.expectEqual(@as(usize, max_frames_in_flight * 3 + text.max_atlas_pages + 1), residency_allocation_cap);
 }
 
 test "surface draw commands preserve layer and frame order" {
@@ -1094,19 +1215,4 @@ test "surface draw commands preserve layer and frame order" {
     try std.testing.expectEqual(@as(u32, 2), commands[2].order);
     try std.testing.expectEqual(scene.DrawKind.mask, commands[2].kind);
     try std.testing.expectEqual(scene.layer_foreground, commands[3].layer);
-}
-
-test "surface stores app font choice without heap-owned strings" {
-    const family = try storeFontFamily("JetBrains Mono Nerd Font");
-    try std.testing.expectEqualStrings("JetBrains Mono Nerd Font", family[0.."JetBrains Mono Nerd Font".len]);
-    try std.testing.expectEqual(@as(u8, 0), family["JetBrains Mono Nerd Font".len]);
-    try std.testing.expectError(Error.InvalidFontOptions, storeFontFamily(""));
-
-    const variations = try storeFontVariations(&.{.{ .tag = text.axis("wght"), .value = 500.0 }});
-    try std.testing.expectEqual(text.axis("wght"), variations[0].tag);
-    try std.testing.expectEqual(@as(f32, 500.0), variations[0].value);
-    try std.testing.expect(fontVariationsEqual(
-        variations[0..1],
-        &.{.{ .tag = text.axis("wght"), .value = 500.0 }},
-    ));
 }

@@ -167,7 +167,7 @@ comptime {
     std.debug.assert(@sizeOf(FrameData) == frameDataByteLen(max_quads));
     std.debug.assert(@sizeOf(TextFrameData) == textFrameDataByteLen(text.max_frame_glyphs));
     std.debug.assert(@sizeOf(MaskFrameData) == maskFrameDataByteLen(max_masks));
-    std.debug.assert(text.max_font_slots == 4);
+    std.debug.assert(text.max_atlas_pages == 4);
     std.debug.assert(@offsetOf(FrameData, "drawable_size") == 0);
     std.debug.assert(@offsetOf(FrameData, "quad_count") == 8);
     std.debug.assert(@offsetOf(FrameData, "quads") == 16);
@@ -520,7 +520,7 @@ fn validColor(color: Color) bool {
 }
 
 fn validGlyph(glyph: text.GlyphInstance) bool {
-    return glyph.font_slot < text.max_font_slots and
+    return glyph.atlas_page < text.max_atlas_pages and
         validLayoutRect(glyph.rect) and
         validAtlasRect(glyph.atlas_rect) and
         validStyleColor(glyph.color);
@@ -806,7 +806,7 @@ test "text compiler rejects malformed glyph payloads" {
     try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data));
 
     glyphs[0].color.r = 1.0;
-    glyphs[0].font_slot = text.max_font_slots;
+    glyphs[0].atlas_page = text.max_atlas_pages;
     try std.testing.expectError(CompileError.InvalidGlyph, compileText(&scene, &frame_data));
 }
 

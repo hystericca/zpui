@@ -7,8 +7,20 @@ pub const max_frame_glyphs = 16384;
 pub const atlas_width = 1024;
 pub const atlas_height = 512;
 pub const atlas_byte_len = atlas_width * atlas_height;
+pub const glyph_atlas_width = 2048;
+pub const glyph_atlas_height = 2048;
+pub const glyph_atlas_byte_len = glyph_atlas_width * glyph_atlas_height;
 pub const glyph_table_len = 128;
 pub const max_font_slots = 4;
+pub const max_fonts = 64;
+pub const max_atlas_pages = 4;
+pub const max_cached_glyphs = 8192;
+pub const max_dirty_rects = 256;
+pub const max_line_glyphs = 4096;
+pub const max_line_runs = 256;
+pub const max_raster_width = 256;
+pub const max_raster_height = 256;
+pub const max_raster_byte_len = max_raster_width * max_raster_height;
 pub const default_font_slot: u32 = 0;
 pub const max_font_family_len = 127;
 pub const max_resolved_font_name_len = 127;
@@ -22,10 +34,18 @@ pub const ascii_last = 126;
 pub const Error = error{
     NoFont,
     InvalidFontSlot,
+    InvalidFontHandle,
+    InvalidFontOptions,
+    FontCapacityExceeded,
     GlyphCapacityExceeded,
+    LineGlyphCapacityExceeded,
+    CachedGlyphCapacityExceeded,
     MissingGlyph,
     UnsupportedCodepoint,
+    InvalidUtf8,
     InvalidAtlas,
+    AtlasFull,
+    RasterTooLarge,
 };
 
 pub const FontVariation = extern struct {
@@ -66,11 +86,116 @@ pub const FontOptions = struct {
     }
 };
 
+pub const FontLoadOptions = struct {
+    face: ?[:0]const u8 = null,
+    variations: []const FontVariation = &.{},
+
+    pub fn valid(options: FontLoadOptions) bool {
+        if (options.face) |face| {
+            if (face.len == 0 or face.len > max_resolved_font_name_len) return false;
+        }
+        if (options.variations.len > max_font_variations) return false;
+        for (options.variations, 0..) |variation, index| {
+            if (!variation.valid()) return false;
+            for (options.variations[0..index]) |previous| {
+                if (previous.tag == variation.tag) return false;
+            }
+        }
+        return true;
+    }
+};
+
+pub const FontHandle = extern struct {
+    index: u32 = std.math.maxInt(u32),
+    generation: u32 = 0,
+
+    pub fn valid(handle: FontHandle) bool {
+        return handle.index < max_fonts and handle.generation != 0;
+    }
+};
+
+pub const FontAxis = extern struct {
+    tag: u32 = 0,
+    min: f32 = 0.0,
+    max: f32 = 0.0,
+    default_value: f32 = 0.0,
+};
+
+pub const FontInfo = struct {
+    postscript_name: []const u8 = &.{},
+    family_name: []const u8 = &.{},
+    display_name: []const u8 = &.{},
+    axes: []const FontAxis = &.{},
+};
+
 pub const glyph_present: u32 = 1 << 0;
 pub const glyph_visible: u32 = 1 << 1;
 
 pub const AtlasStorage = struct {
     bytes: [atlas_byte_len]u8 = [_]u8{0} ** atlas_byte_len,
+};
+
+pub const DirtyRect = extern struct {
+    page: u32 = 0,
+    x: u32 = 0,
+    y: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+};
+
+pub const PackedGlyph = extern struct {
+    page: u32 = 0,
+    x: u32 = 0,
+    y: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+};
+
+pub const GlyphAtlasStorage = struct {
+    bytes: [glyph_atlas_byte_len]u8 = [_]u8{0} ** glyph_atlas_byte_len,
+    next_x: u32 = 0,
+    next_y: u32 = 0,
+    row_height: u32 = 0,
+
+    pub fn clear(atlas: *GlyphAtlasStorage) void {
+        @memset(&atlas.bytes, 0);
+        atlas.next_x = 0;
+        atlas.next_y = 0;
+        atlas.row_height = 0;
+    }
+
+    pub fn append(atlas: *GlyphAtlasStorage, page: u32, width: u32, height: u32, bytes: []const u8, bytes_per_row: u32) Error!PackedGlyph {
+        if (width == 0 or height == 0 or bytes_per_row < width) return Error.InvalidAtlas;
+        if (width > glyph_atlas_width or height > glyph_atlas_height) return Error.AtlasFull;
+        const required_len = @as(usize, @intCast(bytes_per_row)) * @as(usize, @intCast(height));
+        if (bytes.len < required_len) return Error.InvalidAtlas;
+
+        if (atlas.next_x + width > glyph_atlas_width) {
+            atlas.next_x = 0;
+            atlas.next_y += atlas.row_height;
+            atlas.row_height = 0;
+        }
+        if (atlas.next_y + height > glyph_atlas_height) return Error.AtlasFull;
+
+        const dst_x = atlas.next_x;
+        const dst_y = atlas.next_y;
+        var row: u32 = 0;
+        while (row < height) : (row += 1) {
+            const src_start = @as(usize, @intCast(row)) * @as(usize, @intCast(bytes_per_row));
+            const dst_start = @as(usize, @intCast(dst_y + row)) * glyph_atlas_width + @as(usize, @intCast(dst_x));
+            @memcpy(atlas.bytes[dst_start .. dst_start + @as(usize, @intCast(width))], bytes[src_start .. src_start + @as(usize, @intCast(width))]);
+        }
+
+        atlas.next_x += width;
+        atlas.row_height = @max(atlas.row_height, height);
+        return .{
+            .page = page,
+            .x = dst_x,
+            .y = dst_y,
+            .width = width,
+            .height = height,
+        };
+    }
 };
 
 pub const FontMetrics = extern struct {
@@ -116,7 +241,7 @@ pub const GlyphInstance = extern struct {
     rect: layout.Rect = .{},
     atlas_rect: AtlasRect = .{},
     color: style.Color = .{},
-    font_slot: u32 = default_font_slot,
+    atlas_page: u32 = 0,
     // Keep GPU-shared padding as scalars. Metal vector3 types have 16-byte
     // alignment, which does not match a packed host [3]u32 tail.
     reserved: [3]u32 = .{ 0, 0, 0 },
@@ -151,9 +276,96 @@ pub const PushResult = extern struct {
 
 pub const TextRun = struct {
     bytes: []const u8,
+    font: FontHandle,
+    size: f32 = default_font_size,
+    color: style.Color,
+};
+
+pub const AsciiRun = struct {
+    bytes: []const u8,
     color: style.Color,
     font_slot: u32 = default_font_slot,
 };
+
+pub const LineGlyph = struct {
+    instance: GlyphInstance = .{},
+    byte_index: u32 = 0,
+};
+
+pub const TextLineStorage = struct {
+    glyphs: [max_line_glyphs]LineGlyph = undefined,
+};
+
+pub const TextLine = struct {
+    advance: f32 = 0.0,
+    ascent: f32 = 0.0,
+    descent: f32 = 0.0,
+    leading: f32 = 0.0,
+    line_height: f32 = 0.0,
+    baseline_offset: f32 = 0.0,
+    bytes_len: u32 = 0,
+    glyphs: []const LineGlyph = &.{},
+
+    pub fn xForByte(line: TextLine, byte_index: u32) f32 {
+        var x: f32 = 0.0;
+        for (line.glyphs) |glyph| {
+            if (glyph.byte_index > byte_index) break;
+            x = glyph.instance.rect.x;
+            if (glyph.byte_index == byte_index) return x;
+        }
+        if (byte_index >= line.bytes_len) return line.advance;
+        return x;
+    }
+
+    pub fn byteForX(line: TextLine, x: f32) u32 {
+        var closest: u32 = 0;
+        for (line.glyphs) |glyph| {
+            const left = glyph.instance.rect.x;
+            const right = left + glyph.instance.rect.width;
+            if (x < left) return closest;
+            if (x <= right) return glyph.byte_index;
+            closest = glyph.byte_index;
+        }
+        return line.bytes_len;
+    }
+};
+
+pub const GlyphCacheKey = extern struct {
+    font: FontHandle = .{},
+    glyph_id: u32 = 0,
+    size_bits: u32 = 0,
+    scale_bits: u32 = 0,
+    subpixel_x: u32 = 0,
+};
+
+pub const CachedGlyph = extern struct {
+    key: GlyphCacheKey = .{},
+    atlas_rect: AtlasRect = .{},
+    atlas_page: u32 = 0,
+    width: f32 = 0.0,
+    height: f32 = 0.0,
+    offset_x: f32 = 0.0,
+    offset_y_from_baseline: f32 = 0.0,
+};
+
+pub fn glyphCacheKey(font: FontHandle, glyph_id: u32, size: f32, scale: f32, subpixel_x: u32) GlyphCacheKey {
+    return .{
+        .font = font,
+        .glyph_id = glyph_id,
+        .size_bits = @bitCast(size),
+        .scale_bits = @bitCast(scale),
+        .subpixel_x = subpixel_x,
+    };
+}
+
+pub fn glyphCacheKeyEqual(a: GlyphCacheKey, b: GlyphCacheKey) bool {
+    return a.font.index == b.font.index and
+        a.font.generation == b.font.generation and
+        a.glyph_id == b.glyph_id and
+        a.size_bits == b.size_bits and
+        a.scale_bits == b.scale_bits and
+        a.subpixel_x == b.subpixel_x;
+}
 
 pub const MeasureResult = extern struct {
     advance: f32 = 0.0,
@@ -244,7 +456,7 @@ pub fn measureAscii(font: *const Font, bytes: []const u8) Error!MeasureResult {
     };
 }
 
-pub fn measureAsciiRunsWithFontSet(font_set: FontSet, runs: []const TextRun) Error!MeasureResult {
+pub fn measureAsciiRunsWithFontSet(font_set: FontSet, runs: []const AsciiRun) Error!MeasureResult {
     var cursor: f32 = 0.0;
     var glyph_count: u32 = 0;
     var max_height: f32 = 0.0;
@@ -281,7 +493,7 @@ pub fn pushAscii(
     bytes: []const u8,
     color: style.Color,
 ) Error!PushResult {
-    const runs = [_]TextRun{.{ .bytes = bytes, .color = color }};
+    const runs = [_]AsciiRun{.{ .bytes = bytes, .color = color }};
     return pushAsciiRuns(font, out, origin, runs[0..]);
 }
 
@@ -289,7 +501,7 @@ pub fn pushAsciiRuns(
     font: *const Font,
     out: []GlyphInstance,
     origin: layout.Point,
-    runs: []const TextRun,
+    runs: []const AsciiRun,
 ) Error!PushResult {
     return pushAsciiRunsWithFontSet(.{ .fallback = font }, out, origin, runs);
 }
@@ -298,7 +510,7 @@ pub fn pushAsciiRunsWithFontSet(
     font_set: FontSet,
     out: []GlyphInstance,
     origin: layout.Point,
-    runs: []const TextRun,
+    runs: []const AsciiRun,
 ) Error!PushResult {
     var cursor = origin.x;
     var count: usize = 0;
@@ -325,7 +537,7 @@ pub fn pushAsciiRunsWithFontSet(
                         .height = @as(f32, @floatFromInt(metric.atlas_height)) / @as(f32, @floatFromInt(font.metrics.atlas_height)),
                     },
                     .color = run.color,
-                    .font_slot = run.font_slot,
+                    .atlas_page = run.font_slot,
                 };
                 count += 1;
             }
@@ -383,6 +595,56 @@ test "font options keep font choice at the app boundary" {
 test "font variation axis tags use OpenType byte order" {
     try std.testing.expectEqual(@as(u32, 0x77676874), axis("wght"));
     try std.testing.expectEqual(@as(u32, 0x736c6e74), axis("slnt"));
+}
+
+test "font handles and shaped text lines keep byte-index caret data" {
+    const font: FontHandle = .{ .index = 3, .generation = 9 };
+    try std.testing.expect(font.valid());
+
+    var storage: TextLineStorage = undefined;
+    storage.glyphs[0] = .{
+        .instance = .{ .rect = layout.Rect.init(0.0, 2.0, 8.0, 12.0), .atlas_page = 0 },
+        .byte_index = 0,
+    };
+    storage.glyphs[1] = .{
+        .instance = .{ .rect = layout.Rect.init(8.0, 2.0, 8.0, 12.0), .atlas_page = 0 },
+        .byte_index = 3,
+    };
+    const line: TextLine = .{
+        .advance = 16.0,
+        .line_height = 18.0,
+        .baseline_offset = 13.0,
+        .bytes_len = 5,
+        .glyphs = storage.glyphs[0..2],
+    };
+
+    try std.testing.expectEqual(@as(f32, 0.0), line.xForByte(0));
+    try std.testing.expectEqual(@as(f32, 8.0), line.xForByte(3));
+    try std.testing.expectEqual(@as(f32, 16.0), line.xForByte(5));
+    try std.testing.expectEqual(@as(u32, 0), line.byteForX(2.0));
+    try std.testing.expectEqual(@as(u32, 3), line.byteForX(10.0));
+}
+
+test "glyph atlas appends dirty glyph tiles and cache keys stay exact" {
+    var atlas: GlyphAtlasStorage = .{};
+    const pixels = [_]u8{
+        1, 2, 3,
+        4, 5, 6,
+    };
+
+    const placed = try atlas.append(2, 3, 2, pixels[0..], 3);
+    try std.testing.expectEqual(@as(u32, 2), placed.page);
+    try std.testing.expectEqual(@as(u32, 0), placed.x);
+    try std.testing.expectEqual(@as(u32, 0), placed.y);
+    try std.testing.expectEqual(@as(u8, 1), atlas.bytes[0]);
+    try std.testing.expectEqual(@as(u8, 6), atlas.bytes[glyph_atlas_width + 2]);
+
+    const key = glyphCacheKey(.{ .index = 1, .generation = 2 }, 44, 15.0, 2.0, 0);
+    try std.testing.expect(glyphCacheKeyEqual(key, glyphCacheKey(.{ .index = 1, .generation = 2 }, 44, 15.0, 2.0, 0)));
+    try std.testing.expect(!glyphCacheKeyEqual(key, glyphCacheKey(.{ .index = 1, .generation = 2 }, 45, 15.0, 2.0, 0)));
+
+    try std.testing.expectError(Error.InvalidAtlas, atlas.append(0, 0, 1, pixels[0..], 1));
+    try std.testing.expectError(Error.AtlasFull, atlas.append(0, glyph_atlas_width + 1, 1, pixels[0..], glyph_atlas_width + 1));
 }
 
 test "ascii text emits visible glyph instances and advances over spaces" {
@@ -471,7 +733,7 @@ test "ascii text runs preserve one advancing cursor and per glyph colors" {
     };
 
     var glyphs: [2]GlyphInstance = undefined;
-    const runs = [_]TextRun{
+    const runs = [_]AsciiRun{
         .{ .bytes = "A", .color = style.Color.rgb(1.0, 0.0, 0.0) },
         .{ .bytes = "B", .color = style.Color.rgb(0.0, 1.0, 0.0) },
     };

@@ -37,7 +37,7 @@ struct ZPUIGlyph {
     ZPUIRect rect;
     ZPUIAtlasRect atlas_rect;
     float4 color;
-    uint font_slot;
+    uint atlas_page;
     uint reserved0;
     uint reserved1;
     uint reserved2;
@@ -82,7 +82,7 @@ struct ZPUITextVertexOut {
     float4 position [[position]];
     float2 uv;
     float4 color;
-    uint font_slot [[flat]];
+    uint atlas_page [[flat]];
 };
 
 struct ZPUIMaskVertexOut {
@@ -204,7 +204,7 @@ vertex ZPUITextVertexOut zpui_text_vertex(uint vertex_id [[vertex_id]],
         glyph.atlas_rect.y + glyph.atlas_rect.height * corner.y
     );
     out.color = glyph.color;
-    out.font_slot = glyph.font_slot;
+    out.atlas_page = glyph.atlas_page;
     return out;
 }
 
@@ -215,7 +215,7 @@ fragment float4 zpui_text_fragment(ZPUITextVertexOut in [[stage_in]],
                                    texture2d<float> atlas3 [[texture(3)]],
                                    sampler atlas_sampler [[sampler(0)]]) {
     float coverage = 0.0;
-    switch (in.font_slot) {
+    switch (in.atlas_page) {
         case 1:
             coverage = atlas1.sample(atlas_sampler, in.uv).r;
             break;
