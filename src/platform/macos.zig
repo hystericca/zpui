@@ -257,20 +257,24 @@ pub const DrawContext = opaque {
         return ctx.native().surface.fontInfo(handle);
     }
 
-    pub fn shapeLine(ctx: *DrawContext, storage: *text.TextLineStorage, runs: []const text.TextRun) surface.Error!text.TextLine {
+    pub fn shapeLine(ctx: *DrawContext, storage: *text.ShapedLineStorage, runs: []const text.TextRun) surface.Error!text.ShapedLine {
         return ctx.native().surface.shapeLine(storage, runs);
     }
 
-    pub fn beginTextFrame(ctx: *DrawContext, cache: anytype) void {
-        cache.beginFrameGeneration(ctx.native().surface.glyphAtlasGeneration());
+    pub fn prepareTextLine(ctx: *DrawContext, storage: *text.PreparedLineStorage, shaped: text.ShapedLine, runs: []const text.TextRun) surface.Error!text.PreparedLine {
+        return ctx.native().surface.prepareTextLine(storage, shaped, runs);
     }
 
-    pub fn layoutLineCached(ctx: *DrawContext, cache: anytype, runs: []const text.TextRun) surface.Error!text.TextLine {
+    pub fn beginTextFrame(ctx: *DrawContext, cache: anytype) void {
+        _ = ctx;
+        cache.beginFrame();
+    }
+
+    pub fn layoutLineCached(ctx: *DrawContext, cache: anytype, runs: []const text.TextRun) surface.Error!text.ShapedLine {
         return ctx.layoutLineCachedKey(cache, try text.lineCacheKey(runs), runs);
     }
 
-    pub fn layoutLineCachedKey(ctx: *DrawContext, cache: anytype, key: text.LineCacheKey, runs: []const text.TextRun) surface.Error!text.TextLine {
-        cache.ensureGeneration(ctx.native().surface.glyphAtlasGeneration());
+    pub fn layoutLineCachedKey(ctx: *DrawContext, cache: anytype, key: text.LineCacheKey, runs: []const text.TextRun) surface.Error!text.ShapedLine {
         if (try cache.lookup(key)) |cached| return cached;
 
         const shaped = try ctx.native().surface.shapeLine(&cache.scratch, runs);

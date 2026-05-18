@@ -34,7 +34,6 @@ pub const RawTextRun = extern struct {
     font_index: u32,
     font_generation: u32,
     size: f32,
-    color: [4]f32,
 };
 
 pub const RawShapedGlyph = extern struct {
@@ -46,7 +45,6 @@ pub const RawShapedGlyph = extern struct {
     x: f32 = 0.0,
     y: f32 = 0.0,
     size: f32 = 0.0,
-    color: [4]f32 = .{ 0.0, 0.0, 0.0, 0.0 },
 };
 
 pub const RawLineMetrics = extern struct {
@@ -415,7 +413,6 @@ test "macos text shapes utf8 lines and rasterizes glyph coverage" {
         .font_index = 0,
         .font_generation = 1,
         .size = 15.0,
-        .color = .{ 0.8, 0.9, 1.0, 1.0 },
     }};
     var glyphs: [64]RawShapedGlyph = undefined;
     var fallback_fonts: [text.max_fallback_fonts]PlatformFont = @splat(.{});
@@ -444,7 +441,6 @@ test "macos text shapes utf8 lines and rasterizes glyph coverage" {
         .font_index = 0,
         .font_generation = 1,
         .size = 15.0,
-        .color = .{ 1.0, 1.0, 1.0, 1.0 },
     }};
     try std.testing.expectError(Error.InvalidUtf8, shapeLine(bad_runs[0..], glyphs[0..], fallback_fonts[0..]));
 }
@@ -461,7 +457,6 @@ test "macos text reports CoreText fallback font descriptors" {
         .font_index = 0,
         .font_generation = 1,
         .size = 15.0,
-        .color = .{ 1.0, 1.0, 1.0, 1.0 },
     }};
     var glyphs: [64]RawShapedGlyph = undefined;
     var fallback_fonts: [text.max_fallback_fonts]PlatformFont = @splat(.{});

@@ -1,11 +1,11 @@
 const std = @import("std");
 
-const mask = @import("mask.zig");
+const masking = @import("mask.zig");
 const scene = @import("scene.zig");
 const text = @import("text.zig");
 const ui = @import("ui.zig");
 
-const TextLine = text.TextLine;
+const PreparedLine = text.PreparedLine;
 
 pub const Error = scene.SceneBuildError || ui.layout.LayoutError || error{
     HitCapacityExceeded,
@@ -104,7 +104,7 @@ pub const DrawOptions = struct {
     layer: u32 = scene.layer_content,
 };
 
-/// Draw commands for one clip/layer
+/// Draw commands for one clip and layer
 pub const Draw = struct {
     frame: *Frame,
     clip: u32,
@@ -128,9 +128,13 @@ pub const Draw = struct {
         try draw.fill(ruleRect(edge, bounds, width), color);
     }
 
-    pub fn textLine(draw: *Draw, origin: ui.layout.Point, line: TextLine, runs: []const text.TextRun) Error!void {
+    pub fn textLine(draw: *Draw, origin: ui.layout.Point, line: PreparedLine) Error!void {
         try draw.frame.flushQuads();
-        try draw.frame.pushTextLine(origin, line, runs, draw.clip, draw.layer);
+        try draw.frame.pushPreparedTextLine(origin, line, draw.clip, draw.layer);
+    }
+
+    pub fn mask(draw: *Draw, bounds: ui.layout.Rect, atlas_rect: masking.AtlasRect, color: ui.style.Color) Error!void {
+        try draw.frame.pushMask(bounds, atlas_rect, color, draw.clip, draw.layer);
     }
 
     pub fn hit(draw: *Draw, id: ui.hit.HitId, bounds: ui.layout.Rect) Error!void {
@@ -138,23 +142,44 @@ pub const Draw = struct {
     }
 };
 
-pub const Storage = struct {
-    scene: scene.SceneStorage = undefined,
-    layout_results: [scene.max_quads]ui.layout.LayoutResult = undefined,
-    hit_items: [scene.max_quads]ui.hit.HitItem = undefined,
-    glyphs: [text.max_frame_glyphs]text.GlyphInstance = undefined,
-    text_batches: [scene.max_text_batches]scene.TextBatch = undefined,
-    masks: [scene.max_masks]mask.Instance = undefined,
-    mask_batches: [scene.max_mask_batches]scene.MaskBatch = undefined,
-    hit_state: ui.hit.HitState = .{},
+pub const Limits = scene.Limits;
+pub const default_limits = scene.default_limits;
+
+pub fn FrameStorage(comptime limits: Limits) type {
+    comptime limits.assertValid();
+    return struct {
+        pub const storage_limits = limits;
+
+        scene: scene.SceneStorage(limits) = undefined,
+        layout_results: [limits.quads]ui.layout.LayoutResult = undefined,
+        hit_items: [limits.quads]ui.hit.HitItem = undefined,
+        glyphs: [limits.glyphs]text.GlyphInstance = undefined,
+        text_batches: [limits.text_batches]scene.TextBatch = undefined,
+        masks: [limits.masks]masking.Instance = undefined,
+        mask_batches: [limits.mask_batches]scene.MaskBatch = undefined,
+        hit_state: ui.hit.HitState = .{},
+    };
+}
+
+pub const DefaultFrameStorage = FrameStorage(default_limits);
+
+const StorageView = struct {
+    layout_results: []ui.layout.LayoutResult,
+    hit_items: []ui.hit.HitItem,
+    glyphs: []text.GlyphInstance,
+    text_batches: []scene.TextBatch,
+    masks: []masking.Instance,
+    mask_batches: []scene.MaskBatch,
+    hit_state: *ui.hit.HitState,
 };
 
-/// Frame is the per-frame builder plus scratch memory
-/// Normal drawing should go through Draw
+/// Builds one point-space frame from caller storage
+/// No heap here; scale is copied from Surface
+/// Draw order comes from stream writes
 pub const Frame = struct {
     pub const Begin = FrameBegin;
 
-    storage: *Storage,
+    storage: StorageView,
     frame_size_points: [2]f32,
     /// Copied from the surface at frame begin
     /// Used for helpers like hairline() and snapping
@@ -170,9 +195,9 @@ pub const Frame = struct {
     mask_batch_count: u32,
     draw_order: u32,
 
-    pub fn begin(storage: *Storage, options: Begin) Frame {
+    pub fn begin(storage: anytype, options: Begin) Frame {
         return .{
-            .storage = storage,
+            .storage = frameStorageView(storage),
             .frame_size_points = options.frame_size_points,
             .scale = options.scale,
             .input = options.input,
@@ -199,7 +224,7 @@ pub const Frame = struct {
 
     pub fn clipRect(frame: *const Frame, clip_index: u32) Error!ui.layout.Rect {
         if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
-        const rect = frame.storage.scene.clips[@intCast(clip_index)];
+        const rect = frame.scene.storage.clips[@intCast(clip_index)];
         return ui.layout.Rect.init(
             @floatFromInt(rect.x),
             @floatFromInt(rect.y),
@@ -244,22 +269,22 @@ pub const Frame = struct {
         try frame.scene.pushQuad(rect, color, clip_index);
     }
 
-    pub fn pushFill(frame: *Frame, rect: ui.layout.Rect, color: ui.style.Color, clip_index: u32) Error!void {
+    fn pushFill(frame: *Frame, rect: ui.layout.Rect, color: ui.style.Color, clip_index: u32) Error!void {
         try frame.pushQuad(sceneRectFromPoints(rect), renderColor(color), clip_index);
     }
 
-    pub fn pushFillLayer(frame: *Frame, rect: ui.layout.Rect, color: ui.style.Color, clip_index: u32, layer: u32) Error!void {
+    fn pushFillLayer(frame: *Frame, rect: ui.layout.Rect, color: ui.style.Color, clip_index: u32, layer: u32) Error!void {
         try frame.flushQuads();
         try frame.beginLayerBatch(clip_index, layer);
         try frame.pushFill(rect, color, clip_index);
         try frame.endBatch();
     }
 
-    pub fn pushStyledRect(frame: *Frame, rect: ui.layout.Rect, style: ui.style.Style, clip_index: u32) Error!void {
+    fn pushStyledRect(frame: *Frame, rect: ui.layout.Rect, style: ui.style.Style, clip_index: u32) Error!void {
         try frame.scene.pushStyledQuad(sceneRectFromPoints(rect), renderQuadStyle(style), clip_index);
     }
 
-    pub fn pushStyledRectLayer(frame: *Frame, rect: ui.layout.Rect, style: ui.style.Style, clip_index: u32, layer: u32) Error!void {
+    fn pushStyledRectLayer(frame: *Frame, rect: ui.layout.Rect, style: ui.style.Style, clip_index: u32, layer: u32) Error!void {
         try frame.flushQuads();
         try frame.beginLayerBatch(clip_index, layer);
         try frame.pushStyledRect(rect, style, clip_index);
@@ -299,7 +324,7 @@ pub const Frame = struct {
     }
 
     pub fn pushHit(frame: *Frame, item: ui.hit.HitItem) Error!void {
-        if (frame.hit_count >= scene.max_quads) return Error.HitCapacityExceeded;
+        if (atCapacity(frame.hit_count, frame.storage.hit_items.len)) return Error.HitCapacityExceeded;
 
         frame.storage.hit_items[@intCast(frame.hit_count)] = item;
         frame.hit_count += 1;
@@ -310,7 +335,7 @@ pub const Frame = struct {
     }
 
     pub fn hitState(frame: *Frame) *ui.hit.HitState {
-        return &frame.storage.hit_state;
+        return frame.storage.hit_state;
     }
 
     pub fn resolveHot(frame: *Frame) ui.hit.HitId {
@@ -367,16 +392,16 @@ pub const Frame = struct {
         return ui.layout.Rect.init(x0, y0, @max(x1 - x0, 0.0), @max(y1 - y0, 0.0));
     }
 
-    pub fn pushText(frame: *Frame, origin: ui.layout.Point, bytes: []const u8, color: ui.style.Color, clip_index: u32) Error!text.PushResult {
+    fn pushText(frame: *Frame, origin: ui.layout.Point, bytes: []const u8, color: ui.style.Color, clip_index: u32) Error!text.PushResult {
         return frame.pushTextLayer(origin, bytes, color, clip_index, scene.layer_content);
     }
 
-    pub fn pushTextLayer(frame: *Frame, origin: ui.layout.Point, bytes: []const u8, color: ui.style.Color, clip_index: u32, layer: u32) Error!text.PushResult {
+    fn pushTextLayer(frame: *Frame, origin: ui.layout.Point, bytes: []const u8, color: ui.style.Color, clip_index: u32, layer: u32) Error!text.PushResult {
         const runs = [_]text.AsciiRun{.{ .bytes = bytes, .color = color }};
         return frame.pushTextRuns(origin, runs[0..], clip_index, layer);
     }
 
-    pub fn pushTextRuns(frame: *Frame, origin: ui.layout.Point, runs: []const text.AsciiRun, clip_index: u32, layer: u32) Error!text.PushResult {
+    fn pushTextRuns(frame: *Frame, origin: ui.layout.Point, runs: []const text.AsciiRun, clip_index: u32, layer: u32) Error!text.PushResult {
         if (frame.fonts.len == 0 and frame.font == null) return text.Error.NoFont;
         if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
         try frame.flushQuads();
@@ -388,7 +413,7 @@ pub const Frame = struct {
             runs,
         );
         if (result.glyph_count != 0) {
-            if (frame.text_batch_count >= scene.max_text_batches) return Error.TextBatchCapacityExceeded;
+            if (atCapacity(frame.text_batch_count, frame.storage.text_batches.len)) return Error.TextBatchCapacityExceeded;
             frame.storage.text_batches[@intCast(frame.text_batch_count)] = .{
                 .vertex_start = frame.glyph_count * scene.vertices_per_glyph,
                 .vertex_count = result.glyph_count * scene.vertices_per_glyph,
@@ -402,7 +427,7 @@ pub const Frame = struct {
         return result;
     }
 
-    pub fn pushRawTextLine(frame: *Frame, origin: ui.layout.Point, line: text.TextLine, clip_index: u32, layer: u32) Error!void {
+    fn pushPreparedTextLine(frame: *Frame, origin: ui.layout.Point, line: text.PreparedLine, clip_index: u32, layer: u32) Error!void {
         if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
         if (line.glyphs.len == 0) return;
         try frame.flushQuads();
@@ -414,25 +439,6 @@ pub const Frame = struct {
             var instance = glyph.instance;
             instance.rect.x += origin.x;
             instance.rect.y += origin.y;
-            frame.storage.glyphs[used + index] = instance;
-        }
-
-        try frame.appendTextBatch(@intCast(line.glyphs.len), clip_index, layer);
-    }
-
-    pub fn pushTextLine(frame: *Frame, origin: ui.layout.Point, line: text.TextLine, runs: []const text.TextRun, clip_index: u32, layer: u32) Error!void {
-        if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
-        if (line.glyphs.len == 0) return;
-        try frame.flushQuads();
-
-        const used: usize = @intCast(frame.glyph_count);
-        if (line.glyphs.len > frame.storage.glyphs.len - used) return text.Error.GlyphCapacityExceeded;
-
-        for (line.glyphs, 0..) |glyph, index| {
-            var instance = glyph.instance;
-            instance.rect.x += origin.x;
-            instance.rect.y += origin.y;
-            instance.color = text.colorForByte(runs, glyph.byte_index);
             frame.storage.glyphs[used + index] = instance;
         }
 
@@ -440,7 +446,7 @@ pub const Frame = struct {
     }
 
     fn appendTextBatch(frame: *Frame, glyph_count: u32, clip_index: u32, layer: u32) Error!void {
-        if (frame.text_batch_count >= scene.max_text_batches) return Error.TextBatchCapacityExceeded;
+        if (atCapacity(frame.text_batch_count, frame.storage.text_batches.len)) return Error.TextBatchCapacityExceeded;
         const batch_index: usize = @intCast(frame.text_batch_count);
         frame.storage.text_batches[batch_index] = .{
             .vertex_start = frame.glyph_count * scene.vertices_per_glyph,
@@ -460,10 +466,10 @@ pub const Frame = struct {
         };
     }
 
-    pub fn pushMask(frame: *Frame, rect: ui.layout.Rect, atlas_rect: mask.AtlasRect, color: ui.style.Color, clip_index: u32, layer: u32) Error!void {
+    fn pushMask(frame: *Frame, rect: ui.layout.Rect, atlas_rect: masking.AtlasRect, color: ui.style.Color, clip_index: u32, layer: u32) Error!void {
         if (clip_index >= frame.scene.clip_count) return scene.SceneBuildError.InvalidClipIndex;
         if (rect.width <= 0.0 or rect.height <= 0.0) return scene.SceneBuildError.InvalidGeometry;
-        if (frame.mask_count >= scene.max_masks) return Error.MaskCapacityExceeded;
+        if (atCapacity(frame.mask_count, frame.storage.masks.len)) return Error.MaskCapacityExceeded;
         try frame.flushQuads();
 
         const index: usize = @intCast(frame.mask_count);
@@ -483,7 +489,7 @@ pub const Frame = struct {
             }
         }
 
-        if (frame.mask_batch_count >= scene.max_mask_batches) return Error.MaskBatchCapacityExceeded;
+        if (atCapacity(frame.mask_batch_count, frame.storage.mask_batches.len)) return Error.MaskBatchCapacityExceeded;
         frame.storage.mask_batches[@intCast(frame.mask_batch_count)] = .{
             .vertex_start = frame.mask_count * scene.vertices_per_mask,
             .vertex_count = scene.vertices_per_mask,
@@ -503,7 +509,7 @@ pub const Frame = struct {
         return frame.storage.text_batches[0..@intCast(frame.text_batch_count)];
     }
 
-    pub fn masks(frame: *const Frame) []const mask.Instance {
+    pub fn masks(frame: *const Frame) []const masking.Instance {
         return frame.storage.masks[0..@intCast(frame.mask_count)];
     }
 
@@ -514,7 +520,7 @@ pub const Frame = struct {
     pub fn endBatch(frame: *Frame) Error!void {
         try frame.scene.endBatch();
         if (frame.scene.batch_count != 0) {
-            frame.storage.scene.batches[@intCast(frame.scene.batch_count - 1)].order = frame.nextOrder();
+            frame.scene.storage.batches[@intCast(frame.scene.batch_count - 1)].order = frame.nextOrder();
         }
     }
 
@@ -530,9 +536,13 @@ pub const Frame = struct {
 
     fn nextOrder(frame: *Frame) u32 {
         const order = frame.draw_order;
-        std.debug.assert(frame.draw_order < scene.max_draw_commands);
+        std.debug.assert(frame.draw_order < frame.drawCommandLimit());
         frame.draw_order += 1;
         return order;
+    }
+
+    fn drawCommandLimit(frame: *const Frame) u32 {
+        return @intCast(frame.scene.storage.batches.len + frame.storage.text_batches.len + frame.storage.mask_batches.len);
     }
 };
 
@@ -562,6 +572,23 @@ fn clipRectFromPoints(rect: ui.layout.Rect) scene.SceneBuildError!scene.ClipRect
         .width = try clipCoord(x1 - x0),
         .height = try clipCoord(y1 - y0),
     };
+}
+
+fn frameStorageView(storage: anytype) StorageView {
+    comptime @TypeOf(storage.*).storage_limits.assertValid();
+    return .{
+        .layout_results = storage.layout_results[0..],
+        .hit_items = storage.hit_items[0..],
+        .glyphs = storage.glyphs[0..],
+        .text_batches = storage.text_batches[0..],
+        .masks = storage.masks[0..],
+        .mask_batches = storage.mask_batches[0..],
+        .hit_state = &storage.hit_state,
+    };
+}
+
+fn atCapacity(count: u32, len: usize) bool {
+    return @as(usize, @intCast(count)) >= len;
 }
 
 fn renderColor(color: ui.style.Color) scene.Color {
@@ -618,8 +645,8 @@ fn clipCoord(value: f32) scene.SceneBuildError!u32 {
     return @intFromFloat(value);
 }
 
-test "frame owns caller-provided scene storage for one scene" {
-    var storage: Storage = .{};
+test "frame uses caller-provided scene storage for one scene" {
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{
         .frame_size_points = .{ 640.0, 480.0 },
         .scale = 2.0,
@@ -656,7 +683,7 @@ test "input events stay plain frame data" {
 }
 
 test "frame preserves scene builder errors" {
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 320.0, 200.0 } });
     const clip = try frame.pushFrameClip();
 
@@ -668,8 +695,8 @@ test "frame preserves scene builder errors" {
     }, .{ 1.0, 1.0, 1.0, 1.0 }, clip));
 }
 
-test "frame owns layout scratch and reports capacity errors" {
-    var storage: Storage = .{};
+test "frame keeps layout scratch and reports capacity errors" {
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 64.0, 64.0 } });
     const items = [_]ui.layout.LayoutItem{
         ui.layout.LayoutItem.fixed(ui.layout.Size.init(12.0, 8.0)),
@@ -693,7 +720,7 @@ test "frame owns layout scratch and reports capacity errors" {
 }
 
 test "frame direct API cuts roots clips and coalesces adjacent rects" {
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 80.0 } });
 
     const root = frame.root();
@@ -717,8 +744,8 @@ test "frame direct API cuts roots clips and coalesces adjacent rects" {
     try std.testing.expectEqual(scene.layer_surface, out.batches[0].layer);
 }
 
-test "frame resolves hot id through frame-owned hit stream" {
-    var storage: Storage = .{};
+test "frame resolves hot id through hit stream" {
+    var storage: DefaultFrameStorage = .{};
     storage.hit_state = .{ .hot = 99, .active = 7, .focus = 8 };
 
     var frame = Frame.begin(&storage, .{
@@ -741,7 +768,7 @@ test "frame resolves hot id through frame-owned hit stream" {
 }
 
 test "frame rejects hit stream overflow" {
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
     const item = ui.hit.HitItem.init(1, ui.layout.Rect.init(0.0, 0.0, 1.0, 1.0));
 
@@ -751,8 +778,57 @@ test "frame rejects hit stream overflow" {
     try std.testing.expectError(Error.HitCapacityExceeded, frame.pushHit(item));
 }
 
-test "frame push fill converts style color into scene quads" {
-    var storage: Storage = .{};
+test "custom frame storage limits bound frame streams" {
+    const limits: Limits = .{
+        .quads = 2,
+        .batches = 2,
+        .clips = 2,
+        .glyphs = 2,
+        .text_batches = 1,
+        .masks = 1,
+        .mask_batches = 1,
+    };
+    var storage: FrameStorage(limits) = .{};
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
+    const clip = try frame.pushFrameClip();
+    var draw = frame.draw(.{ .clip = clip });
+
+    const items = [_]ui.layout.LayoutItem{
+        ui.layout.LayoutItem.fixed(ui.layout.Size.init(1.0, 1.0)),
+        ui.layout.LayoutItem.fixed(ui.layout.Size.init(1.0, 1.0)),
+        ui.layout.LayoutItem.fixed(ui.layout.Size.init(1.0, 1.0)),
+    };
+    try std.testing.expectError(ui.layout.LayoutError.OutputTooSmall, frame.pack(.{
+        .bounds = ui.layout.Rect.init(0.0, 0.0, 10.0, 10.0),
+    }, items[0..]));
+
+    const hit = ui.hit.HitItem.init(1, ui.layout.Rect.init(0.0, 0.0, 1.0, 1.0));
+    try frame.pushHit(hit);
+    try frame.pushHit(hit);
+    try std.testing.expectError(Error.HitCapacityExceeded, frame.pushHit(hit));
+
+    const atlas_rect = masking.rectFromPixels(1, 1, 1, 1);
+    try draw.mask(ui.layout.Rect.init(0.0, 0.0, 1.0, 1.0), atlas_rect, .{});
+    try std.testing.expectError(Error.MaskCapacityExceeded, draw.mask(ui.layout.Rect.init(2.0, 0.0, 1.0, 1.0), atlas_rect, .{}));
+}
+
+test "draw hit writes a clipped hit item" {
+    var storage: DefaultFrameStorage = .{};
+    var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
+    const clip = try frame.clip(ui.layout.Rect.init(10.0, 10.0, 20.0, 20.0));
+    var draw = frame.draw(.{ .clip = clip });
+
+    try draw.hit(42, ui.layout.Rect.init(0.0, 0.0, 40.0, 40.0));
+    const items = frame.hitItems();
+
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqual(@as(ui.hit.HitId, 42), items[0].id);
+    try std.testing.expectEqual(ui.hit.default_flags | ui.hit.flag_clip, items[0].flags);
+    try std.testing.expectEqual(ui.layout.Rect.init(10.0, 10.0, 20.0, 20.0), items[0].clip);
+}
+
+test "fill helper converts style color into scene quads" {
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 64.0, 64.0 } });
     const clip = try frame.pushFrameClip();
 
@@ -770,8 +846,8 @@ test "frame push fill converts style color into scene quads" {
     try std.testing.expectEqual(@as(f32, 0.0), out.quads[0].border_width);
 }
 
-test "frame push styled rect resolves style into render quad data" {
-    var storage: Storage = .{};
+test "styled rect helper resolves style into render quad data" {
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 64.0, 64.0 } });
     const clip = try frame.pushFrameClip();
 
@@ -795,7 +871,7 @@ test "frame push styled rect resolves style into render quad data" {
     try std.testing.expectEqual(@as(f32, 1.0), out.quads[0].border_width);
 }
 
-test "frame pushes text into a caller-owned glyph stream" {
+test "frame pushes text into caller glyph stream" {
     var font: text.Font = .{};
     font.glyphs['z'] = .{
         .codepoint = 'z',
@@ -805,7 +881,7 @@ test "frame pushes text into a caller-owned glyph stream" {
         .flags = text.glyph_present | text.glyph_visible,
     };
 
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{
         .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,
@@ -844,7 +920,7 @@ test "frame direct API preserves order when text splits rect batches" {
         .flags = text.glyph_present | text.glyph_visible,
     };
 
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{
         .frame_size_points = .{ 100.0, 80.0 },
         .font = &font,
@@ -864,11 +940,11 @@ test "frame direct API preserves order when text splits rect batches" {
     try std.testing.expectEqual(@as(u32, 2), out.batches[1].order);
 }
 
-test "frame pushes shaped text lines without font lookup" {
-    var storage: Storage = .{};
+test "frame pushes prepared text lines without font lookup" {
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 80.0 } });
     const clip = try frame.clip(frame.root());
-    var line_storage: text.TextLineStorage = undefined;
+    var line_storage: text.PreparedLineStorage = undefined;
     line_storage.glyphs[0] = .{
         .instance = .{
             .rect = ui.layout.Rect.init(1.0, 2.0, 5.0, 7.0),
@@ -878,7 +954,7 @@ test "frame pushes shaped text lines without font lookup" {
         },
         .byte_index = 0,
     };
-    const line: text.TextLine = .{
+    const line: text.PreparedLine = .{
         .advance = 6.0,
         .line_height = 12.0,
         .baseline_offset = 9.0,
@@ -886,7 +962,7 @@ test "frame pushes shaped text lines without font lookup" {
         .glyphs = line_storage.glyphs[0..1],
     };
 
-    try frame.pushRawTextLine(ui.layout.Point.init(10.0, 20.0), line, clip, scene.layer_content);
+    try frame.pushPreparedTextLine(ui.layout.Point.init(10.0, 20.0), line, clip, scene.layer_content);
     const out = try frame.finish();
 
     try std.testing.expectEqual(@as(usize, 1), out.glyphs.len);
@@ -895,39 +971,35 @@ test "frame pushes shaped text lines without font lookup" {
     try std.testing.expectEqual(@as(usize, 1), out.text_batches.len);
 }
 
-test "frame paints cached text layouts with current run colors" {
-    var storage: Storage = .{};
+test "draw textLine preserves prepared glyph colors" {
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 80.0 } });
     const clip = try frame.clip(frame.root());
     var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_content });
 
-    var line_storage: text.TextLineStorage = undefined;
+    var line_storage: text.PreparedLineStorage = undefined;
     line_storage.glyphs[0] = .{
         .instance = .{
             .rect = ui.layout.Rect.init(0.0, 0.0, 5.0, 7.0),
-            .color = ui.style.Color.rgb(1.0, 1.0, 1.0),
+            .color = ui.style.Color.rgb(1.0, 0.0, 0.0),
         },
         .byte_index = 0,
     };
     line_storage.glyphs[1] = .{
         .instance = .{
             .rect = ui.layout.Rect.init(6.0, 0.0, 5.0, 7.0),
-            .color = ui.style.Color.rgb(1.0, 1.0, 1.0),
+            .color = ui.style.Color.rgb(0.0, 1.0, 0.0),
         },
         .byte_index = 1,
     };
-    const line: text.TextLine = .{
+    const line: text.PreparedLine = .{
         .advance = 11.0,
         .line_height = 12.0,
         .bytes_len = 2,
         .glyphs = line_storage.glyphs[0..2],
     };
-    const runs = [_]text.TextRun{
-        .{ .bytes = "a", .font = .{ .index = 0, .generation = 1 }, .color = ui.style.Color.rgb(1.0, 0.0, 0.0) },
-        .{ .bytes = "b", .font = .{ .index = 0, .generation = 1 }, .color = ui.style.Color.rgb(0.0, 1.0, 0.0) },
-    };
 
-    try draw.textLine(.{}, line, runs[0..]);
+    try draw.textLine(.{}, line);
     const out = try frame.finish();
 
     try std.testing.expectEqual(@as(usize, 2), out.glyphs.len);
@@ -957,7 +1029,7 @@ test "frame text runs emit one batch with per glyph colors" {
         .flags = text.glyph_present | text.glyph_visible,
     };
 
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{
         .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,
@@ -997,7 +1069,7 @@ test "frame text runs can select fixed font slots" {
         .flags = text.glyph_present | text.glyph_visible,
     };
 
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{
         .frame_size_points = .{ 100.0, 100.0 },
         .font = &fonts[0],
@@ -1034,7 +1106,7 @@ test "frame exposes logical text placement and physical pixel snapping" {
         .flags = text.glyph_present | text.glyph_visible,
     };
 
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{
         .frame_size_points = .{ 100.0, 100.0 },
         .scale = 2.0,
@@ -1050,25 +1122,34 @@ test "frame exposes logical text placement and physical pixel snapping" {
     try std.testing.expectEqual(ui.layout.Rect.init(0.0, 0.5, 10.0, 10.0), snapped);
 }
 
-test "frame exposes layer helpers for editor composition" {
-    var font: text.Font = .{};
-    font.glyphs['z'] = .{
-        .codepoint = 'z',
-        .atlas_width = 7,
-        .atlas_height = 9,
-        .advance = 7.0,
-        .flags = text.glyph_present | text.glyph_visible,
-    };
-    var storage: Storage = .{};
+test "draw writes layer selection into each stream" {
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{
         .frame_size_points = .{ 100.0, 100.0 },
-        .font = &font,
     });
     const clip = try frame.pushFrameClip();
+    var foreground = frame.draw(.{ .clip = clip, .layer = scene.layer_foreground });
+    var overlay = frame.draw(.{ .clip = clip, .layer = scene.layer_overlay });
+    var surface = frame.draw(.{ .clip = clip, .layer = scene.layer_surface });
 
-    try frame.pushFillLayer(ui.layout.Rect.init(0.0, 0.0, 10.0, 10.0), .{}, clip, scene.layer_foreground);
-    _ = try frame.pushTextLayer(.{}, "z", .{}, clip, scene.layer_overlay);
-    try frame.pushMask(ui.layout.Rect.init(16.0, 0.0, 16.0, 16.0), mask.rectFromPixels(1, 1, 16, 16), .{}, clip, scene.layer_surface);
+    var line_storage: text.PreparedLineStorage = undefined;
+    line_storage.glyphs[0] = .{
+        .instance = .{
+            .rect = ui.layout.Rect.init(0.0, 0.0, 7.0, 9.0),
+            .atlas_rect = .{ .x = 0.1, .y = 0.1, .width = 0.1, .height = 0.1 },
+            .color = .{},
+        },
+        .byte_index = 0,
+    };
+    const line: text.PreparedLine = .{
+        .advance = 7.0,
+        .line_height = 10.0,
+        .glyphs = line_storage.glyphs[0..1],
+        .bytes_len = 1,
+    };
+    try foreground.fill(ui.layout.Rect.init(0.0, 0.0, 10.0, 10.0), .{});
+    try overlay.textLine(.{}, line);
+    try surface.mask(ui.layout.Rect.init(16.0, 0.0, 16.0, 16.0), masking.rectFromPixels(1, 1, 16, 16), .{});
     const out = try frame.finish();
 
     try std.testing.expectEqual(scene.layer_foreground, out.batches[0].layer);
@@ -1077,31 +1158,35 @@ test "frame exposes layer helpers for editor composition" {
 }
 
 test "frame layered helpers flush open draw batches" {
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
     const clip = try frame.pushFrameClip();
     var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_content });
 
     try draw.fill(ui.layout.Rect.init(0.0, 0.0, 10.0, 10.0), ui.style.Color.rgb(1.0, 1.0, 1.0));
     try frame.pushFillLayer(ui.layout.Rect.init(12.0, 0.0, 10.0, 10.0), .{}, clip, scene.layer_foreground);
+    try frame.pushStyledRectLayer(ui.layout.Rect.init(24.0, 0.0, 10.0, 10.0), .{}, clip, scene.layer_overlay);
     const out = try frame.finish();
 
-    try std.testing.expectEqual(@as(usize, 2), out.batches.len);
+    try std.testing.expectEqual(@as(usize, 3), out.batches.len);
     try std.testing.expectEqual(scene.layer_content, out.batches[0].layer);
     try std.testing.expectEqual(scene.layer_foreground, out.batches[1].layer);
+    try std.testing.expectEqual(scene.layer_overlay, out.batches[2].layer);
     try std.testing.expectEqual(@as(u32, 0), out.batches[0].order);
     try std.testing.expectEqual(@as(u32, 1), out.batches[1].order);
+    try std.testing.expectEqual(@as(u32, 2), out.batches[2].order);
 }
 
-test "frame pushes masks into a caller-owned mask stream" {
-    var storage: Storage = .{};
+test "draw pushes masks into the frame mask stream" {
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
     const clip = try frame.pushFrameClip();
+    var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_overlay });
 
-    const first_mask = mask.rectFromPixels(1, 1, 16, 16);
-    const second_mask = mask.rectFromPixels(19, 1, 16, 16);
-    try frame.pushMask(ui.layout.Rect.init(4.0, 5.0, 16.0, 16.0), first_mask, ui.style.Color.rgb(0.7, 0.8, 0.9), clip, scene.layer_overlay);
-    try frame.pushMask(ui.layout.Rect.init(22.0, 5.0, 16.0, 16.0), second_mask, ui.style.Color.rgb(0.9, 0.8, 0.7), clip, scene.layer_overlay);
+    const first_mask = masking.rectFromPixels(1, 1, 16, 16);
+    const second_mask = masking.rectFromPixels(19, 1, 16, 16);
+    try draw.mask(ui.layout.Rect.init(4.0, 5.0, 16.0, 16.0), first_mask, ui.style.Color.rgb(0.7, 0.8, 0.9));
+    try draw.mask(ui.layout.Rect.init(22.0, 5.0, 16.0, 16.0), second_mask, ui.style.Color.rgb(0.9, 0.8, 0.7));
     const out = try frame.finish();
 
     try std.testing.expectEqual(@as(usize, 2), out.masks.len);
@@ -1121,17 +1206,18 @@ test "frame does not merge masks across intervening draw commands" {
         .flags = text.glyph_present | text.glyph_visible,
     };
 
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{
         .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,
     });
     const clip = try frame.pushFrameClip();
-    const atlas_rect = mask.rectFromPixels(1, 1, 16, 16);
+    var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_content });
+    const atlas_rect = masking.rectFromPixels(1, 1, 16, 16);
 
-    try frame.pushMask(ui.layout.Rect.init(0.0, 0.0, 16.0, 16.0), atlas_rect, .{}, clip, scene.layer_content);
+    try draw.mask(ui.layout.Rect.init(0.0, 0.0, 16.0, 16.0), atlas_rect, .{});
     _ = try frame.pushTextLayer(ui.layout.Point.init(20.0, 0.0), "z", .{}, clip, scene.layer_content);
-    try frame.pushMask(ui.layout.Rect.init(32.0, 0.0, 16.0, 16.0), atlas_rect, .{}, clip, scene.layer_content);
+    try draw.mask(ui.layout.Rect.init(32.0, 0.0, 16.0, 16.0), atlas_rect, .{});
     const out = try frame.finish();
 
     try std.testing.expectEqual(@as(usize, 2), out.mask_batches.len);
@@ -1141,25 +1227,24 @@ test "frame does not merge masks across intervening draw commands" {
 }
 
 test "frame rejects mask stream overflow explicitly" {
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
     const clip = try frame.pushFrameClip();
-    const atlas_rect = mask.rectFromPixels(1, 1, 1, 1);
+    var draw = frame.draw(.{ .clip = clip, .layer = scene.layer_overlay });
+    const atlas_rect = masking.rectFromPixels(1, 1, 1, 1);
 
     for (0..scene.max_masks) |i| {
-        try frame.pushMask(
+        try draw.mask(
             ui.layout.Rect.init(@floatFromInt(i), 0.0, 1.0, 1.0),
             atlas_rect,
             .{},
-            clip,
-            scene.layer_overlay,
         );
     }
-    try std.testing.expectError(Error.MaskCapacityExceeded, frame.pushMask(ui.layout.Rect.init(0.0, 0.0, 1.0, 1.0), atlas_rect, .{}, clip, scene.layer_overlay));
+    try std.testing.expectError(Error.MaskCapacityExceeded, draw.mask(ui.layout.Rect.init(0.0, 0.0, 1.0, 1.0), atlas_rect, .{}));
 }
 
 test "frame push text requires an explicit font" {
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{ .frame_size_points = .{ 100.0, 100.0 } });
 
     try std.testing.expectError(text.Error.NoFont, frame.measureText("z"));
@@ -1176,7 +1261,7 @@ test "frame rejects text batch overflow" {
         .flags = text.glyph_present | text.glyph_visible,
     };
 
-    var storage: Storage = .{};
+    var storage: DefaultFrameStorage = .{};
     var frame = Frame.begin(&storage, .{
         .frame_size_points = .{ 100.0, 100.0 },
         .font = &font,

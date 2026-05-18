@@ -16,6 +16,66 @@ pub const max_draw_vertices = max_quads * vertices_per_quad;
 pub const max_text_vertices = text.max_frame_glyphs * vertices_per_glyph;
 pub const max_mask_vertices = max_masks * vertices_per_mask;
 
+pub const Limits = struct {
+    quads: u32 = max_quads,
+    batches: u32 = max_batches,
+    clips: u32 = max_clips,
+    glyphs: u32 = text.max_frame_glyphs,
+    text_batches: u32 = max_text_batches,
+    masks: u32 = max_masks,
+    mask_batches: u32 = max_mask_batches,
+
+    pub const Options = struct {
+        quads: ?u32 = null,
+        batches: ?u32 = null,
+        clips: ?u32 = null,
+        glyphs: ?u32 = null,
+        text_batches: ?u32 = null,
+        masks: ?u32 = null,
+        mask_batches: ?u32 = null,
+    };
+
+    pub fn default() Limits {
+        return .{};
+    }
+
+    pub fn editor(options: Options) Limits {
+        return .{
+            .quads = options.quads orelse max_quads,
+            .batches = options.batches orelse max_batches,
+            .clips = options.clips orelse max_clips,
+            .glyphs = options.glyphs orelse text.max_frame_glyphs,
+            .text_batches = options.text_batches orelse max_text_batches,
+            .masks = options.masks orelse max_masks,
+            .mask_batches = options.mask_batches orelse max_mask_batches,
+        };
+    }
+
+    pub fn assertValid(comptime limits: Limits) void {
+        if (limits.quads == 0) @compileError("ZPUI limits need at least one quad");
+        if (limits.batches == 0) @compileError("ZPUI limits need at least one quad batch");
+        if (limits.clips == 0) @compileError("ZPUI limits need at least one clip");
+        if (limits.glyphs == 0) @compileError("ZPUI limits need at least one glyph");
+        if (limits.text_batches == 0) @compileError("ZPUI limits need at least one text batch");
+        if (limits.masks == 0) @compileError("ZPUI limits need at least one mask");
+        if (limits.mask_batches == 0) @compileError("ZPUI limits need at least one mask batch");
+        if (limits.quads > max_quads) @compileError("ZPUI quad storage limit exceeds current renderer cap");
+        if (limits.batches > max_batches) @compileError("ZPUI quad batch storage limit exceeds current renderer cap");
+        if (limits.clips > max_clips) @compileError("ZPUI clip storage limit exceeds current renderer cap");
+        if (limits.glyphs > text.max_frame_glyphs) @compileError("ZPUI glyph storage limit exceeds current renderer cap");
+        if (limits.text_batches > max_text_batches) @compileError("ZPUI text batch storage limit exceeds current renderer cap");
+        if (limits.masks > max_masks) @compileError("ZPUI mask storage limit exceeds current renderer cap");
+        if (limits.mask_batches > max_mask_batches) @compileError("ZPUI mask batch storage limit exceeds current renderer cap");
+        if (drawCommandLimit(limits) > max_draw_commands) @compileError("ZPUI draw command storage limit exceeds current renderer cap");
+    }
+};
+
+pub const default_limits = Limits.default();
+
+pub fn drawCommandLimit(comptime limits: Limits) u32 {
+    return limits.batches + limits.text_batches + limits.mask_batches;
+}
+
 pub const layer_background: u32 = 0;
 pub const layer_surface: u32 = 100;
 pub const layer_content: u32 = 200;
@@ -125,10 +185,23 @@ pub const Scene = struct {
     mask_batches: []const MaskBatch,
 };
 
-pub const SceneStorage = struct {
-    quads: [max_quads]Quad = undefined,
-    batches: [max_batches]Batch = undefined,
-    clips: [max_clips]ClipRect = undefined,
+pub fn SceneStorage(comptime limits: Limits) type {
+    comptime limits.assertValid();
+    return struct {
+        pub const storage_limits = limits;
+
+        quads: [limits.quads]Quad = undefined,
+        batches: [limits.batches]Batch = undefined,
+        clips: [limits.clips]ClipRect = undefined,
+    };
+}
+
+pub const DefaultSceneStorage = SceneStorage(default_limits);
+
+const SceneStorageView = struct {
+    quads: []Quad,
+    batches: []Batch,
+    clips: []ClipRect,
 };
 
 // GPU frame buffers start with the same 16-byte header: frame size,
@@ -234,7 +307,7 @@ pub const MaskCompileResult = struct {
 };
 
 pub const SceneBuilder = struct {
-    storage: *SceneStorage,
+    storage: SceneStorageView,
     frame_size_points: [2]f32,
     clear_color: ClearColor,
     quad_count: u32 = 0,
@@ -245,9 +318,9 @@ pub const SceneBuilder = struct {
     open_batch_layer: u32 = layer_background,
     batch_open: bool = false,
 
-    pub fn begin(storage: *SceneStorage, frame_size_points: [2]f32, clear_color: ClearColor) SceneBuilder {
+    pub fn begin(storage: anytype, frame_size_points: [2]f32, clear_color: ClearColor) SceneBuilder {
         return .{
-            .storage = storage,
+            .storage = sceneStorageView(storage),
             .frame_size_points = frame_size_points,
             .clear_color = clear_color,
         };
@@ -259,7 +332,7 @@ pub const SceneBuilder = struct {
 
     pub fn pushClip(builder: *SceneBuilder, clip: ClipRect) SceneBuildError!u32 {
         if (clip.width == 0 or clip.height == 0) return SceneBuildError.InvalidClip;
-        if (builder.clip_count >= max_clips) return SceneBuildError.ClipCapacityExceeded;
+        if (atCapacity(builder.clip_count, builder.storage.clips.len)) return SceneBuildError.ClipCapacityExceeded;
 
         const index = builder.clip_count;
         builder.storage.clips[@intCast(index)] = clip;
@@ -274,7 +347,7 @@ pub const SceneBuilder = struct {
     pub fn beginLayerBatch(builder: *SceneBuilder, clip_index: u32, layer: u32) SceneBuildError!void {
         if (builder.batch_open) return SceneBuildError.BatchAlreadyOpen;
         if (clip_index >= builder.clip_count) return SceneBuildError.InvalidClipIndex;
-        if (builder.batch_count >= max_batches) return SceneBuildError.BatchCapacityExceeded;
+        if (atCapacity(builder.batch_count, builder.storage.batches.len)) return SceneBuildError.BatchCapacityExceeded;
 
         builder.open_batch_start = builder.quad_count;
         builder.open_batch_clip = clip_index;
@@ -291,7 +364,7 @@ pub const SceneBuilder = struct {
         if (!validRect(rect) or !validQuadStyle(style)) return SceneBuildError.InvalidGeometry;
         if (clip_index >= builder.clip_count) return SceneBuildError.InvalidClipIndex;
         if (clip_index != builder.open_batch_clip) return SceneBuildError.BatchClipMismatch;
-        if (builder.quad_count >= max_quads) return SceneBuildError.QuadCapacityExceeded;
+        if (atCapacity(builder.quad_count, builder.storage.quads.len)) return SceneBuildError.QuadCapacityExceeded;
 
         builder.storage.quads[@intCast(builder.quad_count)] = .{
             .rect = rect,
@@ -473,6 +546,19 @@ pub fn maskFrameDataByteLen(mask_count: u32) usize {
     return @offsetOf(MaskFrameData, "masks") + @as(usize, @intCast(mask_count)) * @sizeOf(mask.Instance);
 }
 
+fn sceneStorageView(storage: anytype) SceneStorageView {
+    comptime @TypeOf(storage.*).storage_limits.assertValid();
+    return .{
+        .quads = storage.quads[0..],
+        .batches = storage.batches[0..],
+        .clips = storage.clips[0..],
+    };
+}
+
+fn atCapacity(count: u32, len: usize) bool {
+    return @as(usize, @intCast(count)) >= len;
+}
+
 fn frameClip(frame_size_points: [2]f32) ClipRect {
     return .{
         .x = 0,
@@ -629,8 +715,32 @@ test "scene compilers reject invalid backing scale" {
     try std.testing.expectError(CompileError.InvalidScale, compileMasks(&scene, &mask_frame_data, std.math.inf(f32)));
 }
 
+test "scene storage limits bound builder streams" {
+    const limits: Limits = .{
+        .quads = 2,
+        .batches = 1,
+        .clips = 1,
+        .glyphs = 1,
+        .text_batches = 1,
+        .masks = 1,
+        .mask_batches = 1,
+    };
+    var storage: SceneStorage(limits) = undefined;
+    var builder = SceneBuilder.begin(&storage, .{ 100.0, 50.0 }, .{ 0, 0, 0, 1 });
+
+    const clip = try builder.pushFrameClip();
+    try std.testing.expectError(SceneBuildError.ClipCapacityExceeded, builder.pushClip(.{ .x = 0, .y = 0, .width = 1, .height = 1 }));
+
+    try builder.beginBatch(clip);
+    try builder.pushQuad(.{ .x = 0.0, .y = 0.0, .width = 1.0, .height = 1.0 }, .{ 1, 1, 1, 1 }, clip);
+    try builder.pushQuad(.{ .x = 2.0, .y = 0.0, .width = 1.0, .height = 1.0 }, .{ 1, 1, 1, 1 }, clip);
+    try std.testing.expectError(SceneBuildError.QuadCapacityExceeded, builder.pushQuad(.{ .x = 4.0, .y = 0.0, .width = 1.0, .height = 1.0 }, .{ 1, 1, 1, 1 }, clip));
+    try builder.endBatch();
+    try std.testing.expectError(SceneBuildError.BatchCapacityExceeded, builder.beginBatch(clip));
+}
+
 test "scene builder records multiple batches and clips" {
-    var storage: SceneStorage = undefined;
+    var storage: DefaultSceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 100.0, 50.0 }, .{ 0, 0, 0, 1 });
     const full_clip = try builder.pushFrameClip();
     const small_clip = try builder.pushClip(.{ .x = 10, .y = 10, .width = 20, .height = 20 });
@@ -651,7 +761,7 @@ test "scene builder records multiple batches and clips" {
 }
 
 test "scene builder frame clip rounds fractional point size outward" {
-    var storage: SceneStorage = undefined;
+    var storage: DefaultSceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 666.5, 333.5 }, .{ 0, 0, 0, 1 });
     const clip = try builder.pushFrameClip();
     const scene = try builder.finish();
@@ -662,7 +772,7 @@ test "scene builder frame clip rounds fractional point size outward" {
 }
 
 test "scene batches carry explicit layers and stream order" {
-    var storage: SceneStorage = undefined;
+    var storage: DefaultSceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 100.0, 50.0 }, .{ 0, 0, 0, 1 });
     const clip = try builder.pushFrameClip();
 
@@ -679,7 +789,7 @@ test "scene batches carry explicit layers and stream order" {
 }
 
 test "scene compiler emits compact GPU frame data" {
-    var storage: SceneStorage = undefined;
+    var storage: DefaultSceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 100.0, 50.0 }, .{ 0.035, 0.045, 0.06, 1.0 });
     const clip = try builder.pushFrameClip();
     try builder.beginBatch(clip);
@@ -708,7 +818,7 @@ test "scene compiler emits compact GPU frame data" {
 }
 
 test "styled quads carry fill border and radius into GPU data" {
-    var storage: SceneStorage = undefined;
+    var storage: DefaultSceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 200.0, 100.0 }, .{ 0, 0, 0, 1 });
     const clip = try builder.pushFrameClip();
 
@@ -957,7 +1067,7 @@ test "mask compiler rejects malformed mask payloads" {
 }
 
 test "scene builder rejects invalid geometry and capacity overflow" {
-    var storage: SceneStorage = undefined;
+    var storage: DefaultSceneStorage = undefined;
     var builder = SceneBuilder.begin(&storage, .{ 640.0, 480.0 }, .{ 0, 0, 0, 1 });
     const clip = try builder.pushFrameClip();
 

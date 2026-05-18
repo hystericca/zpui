@@ -23,16 +23,20 @@ pub const AsciiRun = struct {
     font_slot: u32 = defs.default_font_slot,
 };
 
-pub const LineGlyph = struct {
-    instance: atlas.GlyphInstance = .{},
+pub const ShapedGlyph = struct {
+    font: font.FontHandle = .{},
+    glyph_id: u32 = 0,
     byte_index: u32 = 0,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+    size: f32 = defs.default_font_size,
 };
 
-pub const TextLineStorage = struct {
-    glyphs: [defs.max_line_glyphs]LineGlyph = undefined,
+pub const ShapedLineStorage = struct {
+    glyphs: [defs.max_line_glyphs]ShapedGlyph = undefined,
 };
 
-pub const TextLine = struct {
+pub const ShapedLine = struct {
     advance: f32 = 0.0,
     ascent: f32 = 0.0,
     descent: f32 = 0.0,
@@ -40,9 +44,50 @@ pub const TextLine = struct {
     line_height: f32 = 0.0,
     baseline_offset: f32 = 0.0,
     bytes_len: u32 = 0,
-    glyphs: []const LineGlyph = &.{},
+    glyphs: []const ShapedGlyph = &.{},
 
-    pub fn xForByte(line: TextLine, byte_index: u32) f32 {
+    pub fn xForByte(line: ShapedLine, byte_index: u32) f32 {
+        var x: f32 = 0.0;
+        for (line.glyphs) |glyph| {
+            if (glyph.byte_index > byte_index) break;
+            x = glyph.x;
+            if (glyph.byte_index == byte_index) return x;
+        }
+        if (byte_index >= line.bytes_len) return line.advance;
+        return x;
+    }
+
+    pub fn byteForX(line: ShapedLine, x: f32) u32 {
+        var closest: u32 = 0;
+        for (line.glyphs) |glyph| {
+            if (x < glyph.x) return closest;
+            closest = glyph.byte_index;
+        }
+        if (x < line.advance) return closest;
+        return line.bytes_len;
+    }
+};
+
+pub const PreparedGlyph = struct {
+    instance: atlas.GlyphInstance = .{},
+    byte_index: u32 = 0,
+};
+
+pub const PreparedLineStorage = struct {
+    glyphs: [defs.max_line_glyphs]PreparedGlyph = undefined,
+};
+
+pub const PreparedLine = struct {
+    advance: f32 = 0.0,
+    ascent: f32 = 0.0,
+    descent: f32 = 0.0,
+    leading: f32 = 0.0,
+    line_height: f32 = 0.0,
+    baseline_offset: f32 = 0.0,
+    bytes_len: u32 = 0,
+    glyphs: []const PreparedGlyph = &.{},
+
+    pub fn xForByte(line: PreparedLine, byte_index: u32) f32 {
         var x: f32 = 0.0;
         for (line.glyphs) |glyph| {
             if (glyph.byte_index > byte_index) break;
@@ -53,7 +98,7 @@ pub const TextLine = struct {
         return x;
     }
 
-    pub fn byteForX(line: TextLine, x: f32) u32 {
+    pub fn byteForX(line: PreparedLine, x: f32) u32 {
         var closest: u32 = 0;
         for (line.glyphs) |glyph| {
             const left = glyph.instance.rect.x;
@@ -77,4 +122,17 @@ pub fn colorForByte(runs: []const TextRun, byte_index: u32) style.Color {
         start = end;
     }
     return last;
+}
+
+pub fn runsByteLen(runs: []const TextRun) defs.Error!u32 {
+    if (runs.len == 0 or runs.len > defs.max_line_runs) return defs.Error.InvalidFontOptions;
+
+    var total: usize = 0;
+    const max_text_bytes = std.math.maxInt(u32);
+    for (runs) |run| {
+        if (run.bytes.len == 0) return defs.Error.InvalidUtf8;
+        if (run.bytes.len > max_text_bytes - total) return defs.Error.InvalidUtf8;
+        total += run.bytes.len;
+    }
+    return @intCast(total);
 }

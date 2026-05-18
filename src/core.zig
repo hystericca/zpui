@@ -4,8 +4,8 @@ pub const scene = @import("scene.zig");
 pub const text = @import("text.zig");
 pub const ui = @import("ui.zig");
 
-pub const FrameData = scene.FrameData;
-pub const Font = text.Font;
+pub const Limits = scene.Limits;
+pub const default_limits = scene.default_limits;
 pub const FontHandle = text.FontHandle;
 pub const FontInfo = text.FontInfo;
 pub const FontLoadOptions = text.FontLoadOptions;
@@ -13,20 +13,17 @@ pub const FontVariation = text.FontVariation;
 pub const Draw = frame.Draw;
 pub const DrawOptions = frame.DrawOptions;
 pub const Frame = frame.Frame;
-pub const FrameStorage = frame.Storage;
-pub const MaskAtlasRect = mask.AtlasRect;
-pub const MaskAtlasStorage = mask.AtlasStorage;
-pub const MaskError = mask.Error;
-pub const Scene = scene.Scene;
-pub const SceneBuilder = scene.SceneBuilder;
-pub const SceneStorage = scene.SceneStorage;
+pub const FrameStorage = frame.FrameStorage;
+pub const DefaultFrameStorage = frame.DefaultFrameStorage;
 pub const TextMetrics = text.TextMetrics;
-pub const TextLine = text.TextLine;
+pub const ShapedLine = text.ShapedLine;
+pub const ShapedLineStorage = text.ShapedLineStorage;
+pub const PreparedLine = text.PreparedLine;
 pub const LineCache = text.LineCache;
 pub const LineCacheKey = text.LineCacheKey;
 pub const LineCacheStats = text.LineCacheStats;
 pub const LineCacheType = text.LineCacheType;
-pub const TextLineStorage = text.TextLineStorage;
+pub const PreparedLineStorage = text.PreparedLineStorage;
 pub const RowTextPlacement = text.RowTextPlacement;
 
 pub fn fontAxis(comptime tag: []const u8) u32 {
@@ -40,4 +37,20 @@ pub fn lineCacheKey(runs: []const text.TextRun) text.Error!text.LineCacheKey {
 test {
     const std = @import("std");
     std.testing.refAllDecls(@This());
+}
+
+test "core root keeps renderer internals behind modules" {
+    const std = @import("std");
+    try std.testing.expect(!@hasDecl(@This(), "FrameData"));
+    try std.testing.expect(!@hasDecl(@This(), "Scene"));
+    try std.testing.expect(!@hasDecl(@This(), "SceneBuilder"));
+    try std.testing.expect(!@hasDecl(@This(), "SceneStorage"));
+    try std.testing.expect(!@hasDecl(@This(), "MaskAtlasRect"));
+    try std.testing.expect(!@hasDecl(@This(), "MaskAtlasStorage"));
+    try std.testing.expect(!@hasDecl(@This(), "TextLine"));
+    try std.testing.expect(!@hasDecl(@This(), "TextLineStorage"));
+    try std.testing.expect(@hasDecl(@This(), "ShapedLine"));
+    try std.testing.expect(@hasDecl(@This(), "PreparedLine"));
+    try std.testing.expect(@hasDecl(@This(), "scene"));
+    try std.testing.expect(@hasDecl(@This(), "mask"));
 }

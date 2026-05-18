@@ -280,7 +280,7 @@ pub const Surface = struct {
     command_allocators: [max_frames_in_flight]mtl.command.OwnedCommandAllocator,
     frames: [max_frames_in_flight]GpuFrame,
     draw_commands: [scene.max_draw_commands]scene.DrawCommand = undefined,
-    frame_storage: ui_frame.Storage = .{},
+    frame_storage: ui_frame.DefaultFrameStorage = .{},
     font_records: [text.max_fonts]FontRecord = @splat(.{}),
     glyph_cache: [text.max_cached_glyphs]text.CachedGlyph = @splat(.{}),
     glyph_cache_count: u32 = 0,
@@ -598,7 +598,7 @@ pub const Surface = struct {
         return surface.font_records[index].info();
     }
 
-    pub fn shapeLine(surface: *Surface, storage: *text.TextLineStorage, runs: []const text.TextRun) Error!text.TextLine {
+    pub fn shapeLine(surface: *Surface, storage: *text.ShapedLineStorage, runs: []const text.TextRun) Error!text.ShapedLine {
         if (runs.len == 0 or runs.len > text.max_line_runs) return Error.InvalidFontOptions;
 
         var byte_len: usize = 0;
@@ -615,7 +615,6 @@ pub const Surface = struct {
                 .font_index = run.font.index,
                 .font_generation = run.font.generation,
                 .size = run.size,
-                .color = .{ run.color.r, run.color.g, run.color.b, run.color.a },
             };
             if (run.bytes.len > max_text_bytes - byte_len) return Error.InvalidUtf8;
             byte_len += run.bytes.len;
@@ -636,8 +635,7 @@ pub const Surface = struct {
         );
 
         const glyph_count: usize = @intCast(metrics.glyph_count);
-        var visible_count: usize = 0;
-        for (surface.raw_shaped_glyphs[0..glyph_count]) |raw| {
+        for (surface.raw_shaped_glyphs[0..glyph_count], 0..) |raw, index| {
             const handle = if (raw.fallback_index == text.no_fallback_index) text.FontHandle{
                 .index = raw.font_index,
                 .generation = raw.font_generation,
@@ -645,23 +643,15 @@ pub const Surface = struct {
                 if (raw.fallback_index >= metrics.fallback_count) return Error.InvalidFontHandle;
                 break :fallback fallback_handles[@intCast(raw.fallback_index)];
             };
-            const cached = try surface.ensureGlyph(handle, raw.glyph_id, raw.size, raw.x);
-            if (cached.width == 0.0 or cached.height == 0.0) continue;
-            storage.glyphs[visible_count] = .{
-                .instance = .{
-                    .rect = .{
-                        .x = raw.x + cached.offset_x,
-                        .y = metrics.baseline_offset + raw.y + cached.offset_y_from_baseline,
-                        .width = cached.width,
-                        .height = cached.height,
-                    },
-                    .atlas_rect = cached.atlas_rect,
-                    .color = .{ .r = raw.color[0], .g = raw.color[1], .b = raw.color[2], .a = raw.color[3] },
-                    .atlas_page = cached.atlas_page,
-                },
+
+            storage.glyphs[index] = .{
+                .font = handle,
+                .glyph_id = raw.glyph_id,
                 .byte_index = raw.byte_index,
+                .x = raw.x,
+                .y = raw.y,
+                .size = raw.size,
             };
-            visible_count += 1;
         }
 
         return .{
@@ -672,6 +662,44 @@ pub const Surface = struct {
             .line_height = metrics.line_height,
             .baseline_offset = metrics.baseline_offset,
             .bytes_len = metrics.bytes_len,
+            .glyphs = storage.glyphs[0..glyph_count],
+        };
+    }
+
+    pub fn prepareTextLine(surface: *Surface, storage: *text.PreparedLineStorage, shaped: text.ShapedLine, runs: []const text.TextRun) Error!text.PreparedLine {
+        if (try text.runsByteLen(runs) != shaped.bytes_len) return Error.InvalidFontOptions;
+
+        var visible_count: usize = 0;
+        for (shaped.glyphs) |glyph| {
+            const cached = try surface.ensureGlyph(glyph.font, glyph.glyph_id, glyph.size, glyph.x);
+            if (cached.width == 0.0 or cached.height == 0.0) continue;
+            if (visible_count >= storage.glyphs.len) return Error.LineGlyphCapacityExceeded;
+
+            storage.glyphs[visible_count] = .{
+                .instance = .{
+                    .rect = .{
+                        .x = glyph.x + cached.offset_x,
+                        .y = shaped.baseline_offset + glyph.y + cached.offset_y_from_baseline,
+                        .width = cached.width,
+                        .height = cached.height,
+                    },
+                    .atlas_rect = cached.atlas_rect,
+                    .color = text.colorForByte(runs, glyph.byte_index),
+                    .atlas_page = cached.atlas_page,
+                },
+                .byte_index = glyph.byte_index,
+            };
+            visible_count += 1;
+        }
+
+        return .{
+            .advance = shaped.advance,
+            .ascent = shaped.ascent,
+            .descent = shaped.descent,
+            .leading = shaped.leading,
+            .line_height = shaped.line_height,
+            .baseline_offset = shaped.baseline_offset,
+            .bytes_len = shaped.bytes_len,
             .glyphs = storage.glyphs[0..visible_count],
         };
     }
@@ -1597,7 +1625,7 @@ test "surface metrics count pipeline switches from sorted draw commands" {
 }
 
 test "surface metrics estimate clipped submitted area" {
-    var storage: scene.SceneStorage = .{};
+    var storage: scene.DefaultSceneStorage = .{};
     var builder = scene.SceneBuilder.begin(&storage, .{ 100.0, 100.0 }, .{ 0.0, 0.0, 0.0, 1.0 });
     const full_clip = try builder.pushFrameClip();
     const small_clip = try builder.pushClip(.{ .x = 10, .y = 10, .width = 20, .height = 20 });

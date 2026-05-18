@@ -63,9 +63,12 @@ pub const CachedGlyph = atlas_mod.CachedGlyph;
 pub const PushResult = line_mod.PushResult;
 pub const TextRun = line_mod.TextRun;
 pub const AsciiRun = line_mod.AsciiRun;
-pub const LineGlyph = line_mod.LineGlyph;
-pub const TextLineStorage = line_mod.TextLineStorage;
-pub const TextLine = line_mod.TextLine;
+pub const ShapedGlyph = line_mod.ShapedGlyph;
+pub const ShapedLineStorage = line_mod.ShapedLineStorage;
+pub const ShapedLine = line_mod.ShapedLine;
+pub const PreparedGlyph = line_mod.PreparedGlyph;
+pub const PreparedLineStorage = line_mod.PreparedLineStorage;
+pub const PreparedLine = line_mod.PreparedLine;
 pub const LineCacheKey = cache_mod.LineCacheKey;
 pub const LineCacheStats = cache_mod.LineCacheStats;
 pub const LineCache = cache_mod.LineCache;
@@ -89,6 +92,10 @@ pub fn lineCacheKey(runs: []const TextRun) Error!LineCacheKey {
 
 pub fn colorForByte(runs: []const TextRun, byte_index: u32) style.Color {
     return line_mod.colorForByte(runs, byte_index);
+}
+
+pub fn runsByteLen(runs: []const TextRun) Error!u32 {
+    return line_mod.runsByteLen(runs);
 }
 
 pub const Font = struct {
@@ -347,16 +354,10 @@ test "font handles and shaped text lines keep byte-index caret data" {
     const font: FontHandle = .{ .index = 3, .generation = 9 };
     try std.testing.expect(font.valid());
 
-    var storage: TextLineStorage = undefined;
-    storage.glyphs[0] = .{
-        .instance = .{ .rect = layout.Rect.init(0.0, 2.0, 8.0, 12.0), .atlas_page = 0 },
-        .byte_index = 0,
-    };
-    storage.glyphs[1] = .{
-        .instance = .{ .rect = layout.Rect.init(8.0, 2.0, 8.0, 12.0), .atlas_page = 0 },
-        .byte_index = 3,
-    };
-    const line: TextLine = .{
+    var storage: ShapedLineStorage = undefined;
+    storage.glyphs[0] = .{ .font = font, .glyph_id = 1, .byte_index = 0, .x = 0.0, .size = 15.0 };
+    storage.glyphs[1] = .{ .font = font, .glyph_id = 2, .byte_index = 3, .x = 8.0, .size = 15.0 };
+    const line: ShapedLine = .{
         .advance = 16.0,
         .line_height = 18.0,
         .baseline_offset = 13.0,

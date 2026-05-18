@@ -7,6 +7,8 @@ pub const text = core.text;
 pub const ui = core.ui;
 
 pub const PlatformError = macos.Error;
+pub const Limits = core.Limits;
+pub const default_limits = core.default_limits;
 pub const FontHandle = core.FontHandle;
 pub const FontInfo = core.FontInfo;
 pub const FontLoadOptions = core.FontLoadOptions;
@@ -15,13 +17,16 @@ pub const Draw = core.Draw;
 pub const DrawOptions = core.DrawOptions;
 pub const Frame = core.Frame;
 pub const FrameStorage = core.FrameStorage;
+pub const DefaultFrameStorage = core.DefaultFrameStorage;
 pub const TextMetrics = core.TextMetrics;
-pub const TextLine = core.TextLine;
+pub const ShapedLine = core.ShapedLine;
+pub const ShapedLineStorage = core.ShapedLineStorage;
+pub const PreparedLine = core.PreparedLine;
 pub const LineCache = core.LineCache;
 pub const LineCacheKey = core.LineCacheKey;
 pub const LineCacheStats = core.LineCacheStats;
 pub const LineCacheType = core.LineCacheType;
-pub const TextLineStorage = core.TextLineStorage;
+pub const PreparedLineStorage = core.PreparedLineStorage;
 pub const RowTextPlacement = core.RowTextPlacement;
 
 pub const DrawContext = macos.DrawContext;
@@ -44,7 +49,7 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-test "app root only exposes curated public surface" {
+test "app root has no renderer shortcuts" {
     const std = @import("std");
     try std.testing.expect(@hasDecl(@This(), "ui"));
     try std.testing.expect(@hasDecl(@This(), "text"));
@@ -56,6 +61,35 @@ test "app root only exposes curated public surface" {
     try std.testing.expect(!@hasDecl(@This(), "FrameData"));
     try std.testing.expect(!@hasDecl(@This(), "SceneBuilder"));
     try std.testing.expect(!@hasDecl(@This(), "SceneStorage"));
+    try std.testing.expect(!@hasDecl(@This(), "TextLine"));
+    try std.testing.expect(!@hasDecl(@This(), "TextLineStorage"));
+    try std.testing.expect(!@hasDecl(text, "TextLine"));
+    try std.testing.expect(!@hasDecl(text, "TextLineStorage"));
+    try std.testing.expect(@hasDecl(@This(), "ShapedLine"));
+    try std.testing.expect(@hasDecl(@This(), "PreparedLine"));
+    try std.testing.expect(@hasDecl(Draw, "fill"));
+    try std.testing.expect(@hasDecl(Draw, "rect"));
+    try std.testing.expect(@hasDecl(Draw, "textLine"));
+    try std.testing.expect(@hasDecl(Draw, "mask"));
+    try std.testing.expect(@hasDecl(Draw, "hit"));
+    try std.testing.expect(!@hasDecl(Frame, "pushFill"));
+    try std.testing.expect(!@hasDecl(Frame, "pushStyledRect"));
+    try std.testing.expect(!@hasDecl(Frame, "pushTextLine"));
+    try std.testing.expect(!@hasDecl(Frame, "pushMask"));
+
+    const limits: Limits = .{
+        .quads = 4,
+        .batches = 4,
+        .clips = 4,
+        .glyphs = 4,
+        .text_batches = 4,
+        .masks = 4,
+        .mask_batches = 4,
+    };
+    var custom_storage: FrameStorage(limits) = .{};
+    const Storage = DefaultFrameStorage;
+    _ = &custom_storage;
+    try std.testing.expect(@sizeOf(Storage) > @sizeOf(@TypeOf(custom_storage)));
 
     const begin: Frame.Begin = .{ .frame_size_points = .{ 1.0, 1.0 } };
     try std.testing.expectEqual([2]f32{ 1.0, 1.0 }, begin.frame_size_points);

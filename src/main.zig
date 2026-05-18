@@ -37,6 +37,7 @@ fn draw(ctx: *zpui.DrawContext) zpui.DrawError!void {
     });
 
     var content = frame.draw(.{ .clip = clip, .layer = zpui.scene.layer_content });
+    var text_storage: zpui.PreparedLineStorage = undefined;
     try content.rect(zpui.ui.layout.Rect.init(256.0, 52.0, @max(width - 274.0, 1.0), @max(height - 76.0, 1.0)), .{
         .fill = zpui.ui.style.Color.rgba(0.062, 0.066, 0.073, 0.98),
         .border = zpui.ui.style.Border.solid(1.0, zpui.ui.style.Color.rgba(0.16, 0.18, 0.21, 0.8)),
@@ -59,31 +60,36 @@ fn draw(ctx: *zpui.DrawContext) zpui.DrawError!void {
         .{ .bytes = "main.zig", .font = font, .size = 15.0, .color = zpui.ui.style.Color.rgb(0.82, 0.86, 0.92) },
     };
     const project_row = zpui.ui.layout.Rect.init(52.0, 76.0, 168.0, 28.0);
-    const path_line = try ctx.layoutLineCached(&text_cache, path_runs[0..]);
-    try content.textLine(zpui.ui.layout.Point.init(74.0, project_row.y + @max(0.0, project_row.height - path_line.line_height) * 0.5), path_line, path_runs[0..]);
+    const path_shape = try ctx.layoutLineCached(&text_cache, path_runs[0..]);
+    const path_line = try ctx.prepareTextLine(&text_storage, path_shape, path_runs[0..]);
+    try content.textLine(zpui.ui.layout.Point.init(74.0, project_row.y + @max(0.0, project_row.height - path_line.line_height) * 0.5), path_line);
 
     const tab_runs = [_]zpui.text.TextRun{
         .{ .bytes = "main", .font = font, .size = 15.0, .color = zpui.ui.style.Color.rgb(0.86, 0.89, 0.94) },
         .{ .bytes = ".zig", .font = font, .size = 15.0, .color = zpui.ui.style.Color.rgb(0.52, 0.58, 0.67) },
     };
-    const tab_line = try ctx.layoutLineCached(&text_cache, tab_runs[0..]);
-    try content.textLine(zpui.ui.layout.Point.init(292.0, tab_rect.y + @max(0.0, tab_rect.height - tab_line.line_height) * 0.5), tab_line, tab_runs[0..]);
+    const tab_shape = try ctx.layoutLineCached(&text_cache, tab_runs[0..]);
+    const tab_line = try ctx.prepareTextLine(&text_storage, tab_shape, tab_runs[0..]);
+    try content.textLine(zpui.ui.layout.Point.init(292.0, tab_rect.y + @max(0.0, tab_rect.height - tab_line.line_height) * 0.5), tab_line);
 
     const code_runs = [_]zpui.text.TextRun{
         .{ .bytes = "const frame = ctx.beginFrame(.{});", .font = font, .size = 15.0, .color = zpui.ui.style.Color.rgb(0.88, 0.90, 0.92) },
     };
-    const code_line = try ctx.layoutLineCached(&text_cache, code_runs[0..]);
-    try content.textLine(zpui.ui.layout.Point.init(292.0, 112.0), code_line, code_runs[0..]);
+    const code_shape = try ctx.layoutLineCached(&text_cache, code_runs[0..]);
+    const code_line = try ctx.prepareTextLine(&text_storage, code_shape, code_runs[0..]);
+    try content.textLine(zpui.ui.layout.Point.init(292.0, 112.0), code_line);
     const api_runs = [_]zpui.text.TextRun{
         .{ .bytes = "try d.textLine(...);", .font = font, .size = 15.0, .color = zpui.ui.style.Color.rgb(0.70, 0.78, 0.90) },
     };
-    const api_line = try ctx.layoutLineCached(&text_cache, api_runs[0..]);
-    try content.textLine(zpui.ui.layout.Point.init(292.0, 134.0), api_line, api_runs[0..]);
+    const api_shape = try ctx.layoutLineCached(&text_cache, api_runs[0..]);
+    const api_line = try ctx.prepareTextLine(&text_storage, api_shape, api_runs[0..]);
+    try content.textLine(zpui.ui.layout.Point.init(292.0, 134.0), api_line);
     const accent_runs = [_]zpui.text.TextRun{
         .{ .bytes = "15pt text, caf\u{e9}, fallback: \u{6f22}\u{5b57}, ffi", .font = font, .size = 15.0, .color = zpui.ui.style.Color.rgb(0.50, 0.55, 0.62) },
     };
-    const accent_line = try ctx.layoutLineCached(&text_cache, accent_runs[0..]);
-    try content.textLine(zpui.ui.layout.Point.init(292.0, 178.0), accent_line, accent_runs[0..]);
+    const accent_shape = try ctx.layoutLineCached(&text_cache, accent_runs[0..]);
+    const accent_line = try ctx.prepareTextLine(&text_storage, accent_shape, accent_runs[0..]);
+    try content.textLine(zpui.ui.layout.Point.init(292.0, 178.0), accent_line);
 
     var foreground = frame.draw(.{ .clip = clip, .layer = zpui.scene.layer_foreground });
     try foreground.fill(zpui.ui.layout.Rect.init(289.0, 132.0, 2.0, 18.0), zpui.ui.style.Color.rgb(0.52, 0.76, 1.0));

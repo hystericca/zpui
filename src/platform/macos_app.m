@@ -129,7 +129,6 @@ typedef struct {
     uint32_t font_index;
     uint32_t font_generation;
     float size;
-    float color[4];
 } ZPUIRawTextRun;
 
 typedef struct {
@@ -141,7 +140,6 @@ typedef struct {
     float x;
     float y;
     float size;
-    float color[4];
 } ZPUIRawShapedGlyph;
 
 typedef struct {
@@ -1458,7 +1456,6 @@ int zpui_macos_shape_line(const ZPUIRawTextRun *runs, uint32_t runCount,
             out->x = (float)positions[glyphIndex].x;
             out->y = (float)positions[glyphIndex].y;
             out->size = sourceRun->size;
-            memcpy(out->color, sourceRun->color, sizeof(out->color));
         }
 
         free(glyphs);

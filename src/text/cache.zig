@@ -38,7 +38,7 @@ const LineCacheEntry = extern struct {
     glyph_start: u32 = 0,
     glyph_count: u32 = 0,
 
-    fn fromLine(key: LineCacheKey, glyph_start: u32, shaped: line.TextLine) LineCacheEntry {
+    fn fromLine(key: LineCacheKey, glyph_start: u32, shaped: line.ShapedLine) LineCacheEntry {
         return .{
             .key = key,
             .advance = shaped.advance,
@@ -53,7 +53,7 @@ const LineCacheEntry = extern struct {
         };
     }
 
-    fn asLine(entry: LineCacheEntry, glyphs: []const line.LineGlyph) line.TextLine {
+    fn asLine(entry: LineCacheEntry, glyphs: []const line.ShapedGlyph) line.ShapedLine {
         const start: usize = @intCast(entry.glyph_start);
         const count: usize = @intCast(entry.glyph_count);
         return .{
@@ -74,14 +74,14 @@ pub fn LineCacheType(comptime entry_capacity: usize, comptime glyph_capacity: us
         banks: [2]Bank = .{ .{}, .{} },
         active: u32 = 0,
         generation: u64 = 0,
-        scratch: line.TextLineStorage = undefined,
+        scratch: line.ShapedLineStorage = undefined,
         stats: LineCacheStats = .{},
 
         const Self = @This();
 
         const Bank = struct {
             entries: [entry_capacity]LineCacheEntry = @splat(.{}),
-            glyphs: [glyph_capacity]line.LineGlyph = undefined,
+            glyphs: [glyph_capacity]line.ShapedGlyph = undefined,
             entry_count: u32 = 0,
             glyph_count: u32 = 0,
 
@@ -97,7 +97,7 @@ pub fn LineCacheType(comptime entry_capacity: usize, comptime glyph_capacity: us
                 return null;
             }
 
-            fn append(bank: *Bank, key: LineCacheKey, shaped: line.TextLine) defs.Error!line.TextLine {
+            fn append(bank: *Bank, key: LineCacheKey, shaped: line.ShapedLine) defs.Error!line.ShapedLine {
                 if (bank.entry_count >= entry_capacity) return defs.Error.LineCacheCapacityExceeded;
                 if (shaped.glyphs.len > glyph_capacity - @as(usize, @intCast(bank.glyph_count))) {
                     return defs.Error.LineCacheCapacityExceeded;
@@ -107,7 +107,6 @@ pub fn LineCacheType(comptime entry_capacity: usize, comptime glyph_capacity: us
                 const dst_start: usize = @intCast(glyph_start);
                 for (shaped.glyphs, 0..) |glyph, index| {
                     bank.glyphs[dst_start + index] = glyph;
-                    bank.glyphs[dst_start + index].instance.color = style.Color.rgb(1.0, 1.0, 1.0);
                 }
 
                 const entry = LineCacheEntry.fromLine(key, glyph_start, shaped);
@@ -142,7 +141,7 @@ pub fn LineCacheType(comptime entry_capacity: usize, comptime glyph_capacity: us
             cache.generation = generation;
         }
 
-        pub fn lookup(cache: *Self, key: LineCacheKey) defs.Error!?line.TextLine {
+        pub fn lookup(cache: *Self, key: LineCacheKey) defs.Error!?line.ShapedLine {
             if (cache.current().find(key)) |entry| {
                 cache.stats.current_hits += 1;
                 return entry.asLine(cache.current().glyphs[0..]);
@@ -158,7 +157,7 @@ pub fn LineCacheType(comptime entry_capacity: usize, comptime glyph_capacity: us
             return null;
         }
 
-        pub fn store(cache: *Self, key: LineCacheKey, shaped: line.TextLine) defs.Error!line.TextLine {
+        pub fn store(cache: *Self, key: LineCacheKey, shaped: line.ShapedLine) defs.Error!line.ShapedLine {
             cache.stats.stores += 1;
             return cache.current().append(key, shaped);
         }
@@ -176,27 +175,22 @@ pub fn LineCacheType(comptime entry_capacity: usize, comptime glyph_capacity: us
 pub const LineCache = LineCacheType(defs.max_line_cache_entries, defs.max_line_cache_glyphs);
 
 pub fn lineCacheKey(runs: []const line.TextRun) defs.Error!LineCacheKey {
-    if (runs.len == 0 or runs.len > defs.max_line_runs) return defs.Error.InvalidFontOptions;
+    const bytes_len = try line.runsByteLen(runs);
 
     var text_hasher = std.hash.Wyhash.init(0x7a_70_75_69);
     var run_hasher = std.hash.Wyhash.init(0x74_65_78_74);
-    var bytes_len: usize = 0;
-    const max_text_bytes = std.math.maxInt(u32);
 
     for (runs) |run| {
         text_hasher.update(run.bytes);
         hashUsize(&run_hasher, run.bytes.len);
         hashFont(&run_hasher, run.font);
         hashF32(&run_hasher, run.size);
-
-        if (run.bytes.len > max_text_bytes - bytes_len) return defs.Error.InvalidUtf8;
-        bytes_len += run.bytes.len;
     }
 
     return .{
         .text_hash = text_hasher.final(),
         .run_hash = run_hasher.final(),
-        .bytes_len = @intCast(bytes_len),
+        .bytes_len = bytes_len,
         .run_count = @intCast(runs.len),
     };
 }
@@ -246,11 +240,11 @@ test "line cache hits current and previous frame banks" {
     var cache: LineCacheType(4, 8) = .{};
     cache.beginFrame();
 
-    var storage: line.TextLineStorage = undefined;
-    storage.glyphs[0] = .{ .byte_index = 0, .instance = .{ .color = style.Color.rgb(1.0, 0.0, 0.0) } };
-    storage.glyphs[1] = .{ .byte_index = 1, .instance = .{ .color = style.Color.rgb(0.0, 1.0, 0.0) } };
+    var storage: line.ShapedLineStorage = undefined;
+    storage.glyphs[0] = .{ .font = .{ .index = 1, .generation = 1 }, .glyph_id = 11, .byte_index = 0, .x = 1.0, .size = 15.0 };
+    storage.glyphs[1] = .{ .font = .{ .index = 1, .generation = 1 }, .glyph_id = 12, .byte_index = 1, .x = 6.0, .size = 15.0 };
     const key: LineCacheKey = .{ .text_hash = 1, .run_hash = 2, .bytes_len = 2, .run_count = 1 };
-    const shaped: line.TextLine = .{
+    const shaped: line.ShapedLine = .{
         .advance = 12.0,
         .line_height = 18.0,
         .bytes_len = 2,
@@ -260,7 +254,7 @@ test "line cache hits current and previous frame banks" {
     const stored = try cache.store(key, shaped);
     try std.testing.expectEqual(@as(usize, 2), stored.glyphs.len);
     try std.testing.expectEqual(@as(u32, 0), stored.glyphs[0].byte_index);
-    try std.testing.expectEqual(style.Color.rgb(1.0, 1.0, 1.0), stored.glyphs[0].instance.color);
+    try std.testing.expectEqual(@as(u32, 11), stored.glyphs[0].glyph_id);
     try std.testing.expectEqual(@as(u32, 1), cache.stats.stores);
 
     const current = (try cache.lookup(key)).?;
@@ -274,14 +268,14 @@ test "line cache hits current and previous frame banks" {
     try std.testing.expectEqual(@as(u32, 1), cache.banks[@intCast(cache.active)].entry_count);
 }
 
-test "line cache clears stale banks when atlas generation changes" {
+test "line cache clears when generation changes" {
     var cache: LineCacheType(4, 8) = .{};
     cache.beginFrameGeneration(1);
 
-    var storage: line.TextLineStorage = undefined;
+    var storage: line.ShapedLineStorage = undefined;
     storage.glyphs[0] = .{ .byte_index = 0 };
     const key: LineCacheKey = .{ .text_hash = 1, .run_hash = 2, .bytes_len = 1, .run_count = 1 };
-    const shaped: line.TextLine = .{
+    const shaped: line.ShapedLine = .{
         .bytes_len = 1,
         .glyphs = storage.glyphs[0..1],
     };
@@ -298,13 +292,13 @@ test "line cache reports fixed capacity exhaustion" {
     var cache: LineCacheType(1, 1) = .{};
     cache.beginFrame();
 
-    var storage: line.TextLineStorage = undefined;
+    var storage: line.ShapedLineStorage = undefined;
     storage.glyphs[0] = .{ .byte_index = 0 };
     storage.glyphs[1] = .{ .byte_index = 1 };
-    const too_many_glyphs: line.TextLine = .{ .glyphs = storage.glyphs[0..2] };
+    const too_many_glyphs: line.ShapedLine = .{ .glyphs = storage.glyphs[0..2] };
     try std.testing.expectError(defs.Error.LineCacheCapacityExceeded, cache.store(.{ .text_hash = 1 }, too_many_glyphs));
 
-    const one_glyph: line.TextLine = .{ .glyphs = storage.glyphs[0..1] };
+    const one_glyph: line.ShapedLine = .{ .glyphs = storage.glyphs[0..1] };
     _ = try cache.store(.{ .text_hash = 2 }, one_glyph);
     try std.testing.expectError(defs.Error.LineCacheCapacityExceeded, cache.store(.{ .text_hash = 3 }, one_glyph));
 }
